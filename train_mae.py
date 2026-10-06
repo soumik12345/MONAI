@@ -28,6 +28,12 @@ CUDA batch after loading and cropping, before drawing the MAE mask. Install
 BatchAug from https://github.com/halleewong/batchaug to use that option.
 Yale's PRE/POST/T2/FLAIR are sampled as independent single-channel volumes.
 Patients remain disjoint across splits, and only train patients are pretrained.
+Training logs masked MSE and MAE. Validation additionally logs foreground
+masked MSE and masked SSIM, grouped by sequence and fixed mask ratios
+(--val-mask-ratios, default .6 .75 .9). SSIM uses uniform 7^3 windows entirely
+inside hidden blocks, clipping z-scored intensities to [-5,5] by default
+(--ssim-data-range 10). Foreground is the nonzero mask before normalization,
+not a brain segmentation. Additional fixed-ratio passes increase validation cost.
 Existing single-sequence manifests still work; prepare a new output directory
 to include all sequences. Original baseline checkpoints are incompatible.
 
@@ -272,8 +278,11 @@ def make_transforms(roi, training, augmentation_backend="monai"):
         AddValidd("image"),
         CropForegroundd(keys, source_key="valid", margin=4, allow_smaller=True),
         NormalizeIntensityd("image", nonzero=True, channel_wise=True),
-        DeleteItemsd("valid"),
-        SpatialPadd("image", spatial_size=roi),
+    ]
+    if training:
+        transforms.append(DeleteItemsd("valid"))
+    transforms += [
+        SpatialPadd("image" if training else keys, spatial_size=roi),
     ]
     if training:
         transforms.append(RandSpatialCropd("image", roi_size=roi, random_size=False))
@@ -293,8 +302,8 @@ def make_transforms(roi, training, augmentation_backend="monai"):
         elif augmentation_backend != "batchaug":
             raise ValueError(f"Unknown augmentation backend: {augmentation_backend}")
     else:
-        transforms += [CenterSpatialCropd("image", roi_size=roi)]
-    return Compose(transforms + [EnsureTyped("image", dtype=torch.float32, track_meta=False)])
+        transforms += [CenterSpatialCropd(keys, roi_size=roi)]
+    return Compose(transforms + [EnsureTyped("image" if training else keys, dtype=torch.float32, track_meta=False)])
 
 
 def make_batch_augmenter():
@@ -317,23 +326,84 @@ def make_batch_augmenter():
     )
 
 
+def reconstruction_totals(prediction, target, mask, foreground, ssim_data_range=None):
+    """Return numerators/denominators for voxel-weighted reconstruction metrics."""
+    hidden = expand_mask(mask, target.shape[2:]).bool().expand_as(target)
+    error = prediction.detach().float() - target.float()
+    squared = error.square()
+    tissue = hidden & foreground.bool()
+    totals = {
+        "masked_mse": ((squared * hidden).sum().item(), hidden.sum().item()),
+        "masked_mae": ((error.abs() * hidden).sum().item(), hidden.sum().item()),
+        "foreground_masked_mse": ((squared * tissue).sum().item(), tissue.sum().item()),
+    }
+    if ssim_data_range is not None:
+        # Z-scored MRI has no natural bounded range. Clip ONLY for SSIM to a
+        # fixed symmetric interval (default [-5, 5]); MSE/MAE remain unclipped.
+        limit = ssim_data_range / 2
+        pred = prediction.detach().float().clamp(-limit, limit)
+        truth = target.float().clamp(-limit, limit)
+
+        def pool(image):
+            # Separable uniform filtering avoids the cost of a dense 7^3 kernel.
+            for kernel in ((7, 1, 1), (1, 7, 1), (1, 1, 7)):
+                image = F.avg_pool3d(image, kernel_size=kernel, stride=1)
+            return image
+
+        mu_p, mu_t = pool(pred), pool(truth)
+        var_p = (pool(pred.square()) - mu_p.square()).clamp_min(0)
+        var_t = (pool(truth.square()) - mu_t.square()).clamp_min(0)
+        covariance = pool(pred * truth) - mu_p * mu_t
+        c1, c2 = (0.01 * ssim_data_range) ** 2, (0.03 * ssim_data_range) ** 2
+        ssim = ((2 * mu_p * mu_t + c1) * (2 * covariance + c2)) / (
+            (mu_p.square() + mu_t.square() + c1) * (var_p + var_t + c2)
+        )
+        # Include only windows wholly inside hidden blocks, preventing visible
+        # voxels from inflating the reconstruction score. Uniform 7^3 windows.
+        windows = pool(hidden.float()) > 1 - 1e-6
+        totals["masked_ssim"] = ((ssim * windows).sum().item(), windows.sum().item())
+    return totals
+
+
+def add_metric_totals(accumulator, prefix, totals):
+    for metric, (numerator, denominator) in totals.items():
+        key = f"{prefix}/{metric}"
+        old_n, old_d = accumulator.get(key, (0.0, 0.0))
+        accumulator[key] = (old_n + numerator, old_d + denominator)
+
+
 @torch.no_grad()
 def validate(model, loader, device, args):
     model.eval()
-    # Fixed center crops and re-created generator keep validation comparable.
+    # Independent streams keep dynamic validation and each fixed ratio stable.
     generator = torch.Generator(device=device).manual_seed(args.seed + 1000)
-    total, count = 0.0, 0
+    ratios = getattr(args, "val_mask_ratios", (0.6, 0.75, 0.9))
+    fixed_generators = [torch.Generator(device=device).manual_seed(args.seed + 2000 + i) for i in range(len(ratios))]
+    totals = {}
     for batch in loader:
         x = batch["image"].to(device)
-        ratio = draw_mask_ratio(args, generator, device)
-        mask = block_mask(x, args.block, ratio, generator, coarse=True)
-        with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
-            prediction = model(x, mask)
-            loss = masked_mse(prediction, x, mask)
-        hidden_count = mask.sum().item() * args.block**3
-        total += loss.item() * hidden_count
-        count += hidden_count
-    return total / count
+        foreground = batch["valid"].to(device)
+        evaluations = [(None, draw_mask_ratio(args, generator, device), generator)]
+        evaluations += [(f"{ratio:g}", ratio, rng) for ratio, rng in zip(ratios, fixed_generators)]
+        for label, ratio, rng in evaluations:
+            mask = block_mask(x, args.block, ratio, rng, coarse=True)
+            with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                prediction = model(x, mask)
+            prefix = "val" if label is None else f"val/mask_ratio_{label}"
+            for i in range(x.shape[0]):
+                metrics = reconstruction_totals(
+                    prediction[i : i + 1],
+                    x[i : i + 1],
+                    mask[i : i + 1],
+                    foreground[i : i + 1],
+                    ssim_data_range=getattr(args, "ssim_data_range", 10.0),
+                )
+                add_metric_totals(totals, prefix, metrics)
+                if label is None:
+                    sequence = batch.get("sequence", ["unknown"] * x.shape[0])[i]
+                    add_metric_totals(totals, f"val/sequence_{sequence}", metrics)
+    # Omit undefined foreground/window metrics rather than report misleading zeros.
+    return {key: numerator / denominator for key, (numerator, denominator) in totals.items() if denominator > 0}
 
 
 def draw_mask_ratio(args, generator, device):
@@ -550,7 +620,7 @@ def train(args):
     try:
         with tqdm(total=args.steps, initial=completed, desc="Training", unit="update", dynamic_ncols=True) as progress:
             batches = iter(train_loader)
-            total, logged_steps = 0.0, 0
+            total, total_mae, logged_steps = 0.0, 0.0, 0
             while completed < args.steps:
                 model.train()
                 lr = poly_lr(args.lr, completed, args.steps, args.poly_power)
@@ -560,7 +630,7 @@ def train(args):
                 # Share a ratio across the whole effective batch so accumulation uses the
                 # same masked-voxel weighting as a physical batch of six.
                 ratio = draw_mask_ratio(args, mask_generator, device)
-                step_loss = 0.0
+                step_loss, step_mae = 0.0, 0.0
                 for _ in range(args.accumulation):
                     try:
                         batch = next(batches)
@@ -573,11 +643,17 @@ def train(args):
                         x = batch_augmenter({"image": x})["image"]
                     mask = block_mask(x, args.block, ratio, mask_generator, coarse=True)
                     with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
-                        loss = masked_mse(model(x, mask), x, mask)
+                        prediction = model(x, mask)
+                        loss = masked_mse(prediction, x, mask)
                     if not torch.isfinite(loss):
                         raise FloatingPointError("Nonfinite reconstruction loss; inspect the current volumes.")
                     scaler.scale(loss / args.accumulation).backward()
                     step_loss += loss.item() / args.accumulation
+                    with torch.no_grad():
+                        hidden = expand_mask(mask, x.shape[2:])
+                        step_mae += (
+                            ((prediction.detach().float() - x.float()).abs() * hidden).sum() / hidden.sum().clamp_min(1)
+                        ).item() / args.accumulation
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 previous_scale = scaler.get_scale()
@@ -589,6 +665,7 @@ def train(args):
                 completed += 1
                 progress.update(1)
                 total += step_loss
+                total_mae += step_mae
                 logged_steps += 1
                 if completed % args.log_every == 0 or completed == args.steps:
                     progress.set_postfix(train_loss=f"{total / logged_steps:.5f}", lr=f"{lr:.6g}")
@@ -598,19 +675,21 @@ def train(args):
                             {
                                 "optimizer_step": completed,
                                 "train/masked_mse": total / logged_steps,
+                                "train/masked_mae": total_mae / logged_steps,
                                 "train/lr": lr,
                                 "train/mask_ratio": ratio,
                             }
                         )
-                    total, logged_steps = 0.0, 0
+                    total, total_mae, logged_steps = 0.0, 0.0, 0
                 if completed % args.validate_every == 0 or completed == args.steps:
-                    val_loss = validate(model, val_loader, device, args)
+                    val_metrics = validate(model, val_loader, device, args)
+                    val_loss = val_metrics["val/masked_mse"]
                     tqdm.write(f"Step {completed}: validation masked MSE={val_loss:.5f}")
                     if wandb_run is not None:
                         wandb_run.log(
                             {
                                 "optimizer_step": completed,
-                                "val/masked_mse": val_loss,
+                                **val_metrics,
                                 "val/best_masked_mse": min(best, val_loss),
                             }
                         )
@@ -740,6 +819,19 @@ def main():
     parser.add_argument("--no-checkpointing", action="store_true", help="Disable activation checkpointing")
     parser.add_argument("--validate-every", type=int, default=1000)
     parser.add_argument("--val-volumes", type=int, default=25, help="Fixed validation subset; 0 uses all")
+    parser.add_argument(
+        "--val-mask-ratios",
+        type=float,
+        nargs="+",
+        default=(0.6, 0.75, 0.9),
+        help="Additional fixed-ratio reconstruction validation passes",
+    )
+    parser.add_argument(
+        "--ssim-data-range",
+        type=float,
+        default=10.0,
+        help="SSIM clipping interval width in z-score units (default [-5,5])",
+    )
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases metric logging")
@@ -785,6 +877,10 @@ def main():
         or args.weight_decay < 0
     ):
         parser.error("Training sizes/rates must be positive; momentum in (0,1); weight decay >=0")
+    if any(not math.isfinite(r) or not 0 < r < 1 for r in args.val_mask_ratios):
+        parser.error("val-mask-ratios must be finite and in (0,1)")
+    if not math.isfinite(args.ssim_data_range) or args.ssim_data_range <= 0:
+        parser.error("ssim-data-range must be finite and positive")
     if min(args.workers, args.val_volumes) < 0:
         parser.error("workers and val-volumes must be nonnegative")
     {"train": train, "export": export, "smoke-test": smoke_test}[args.command](args)

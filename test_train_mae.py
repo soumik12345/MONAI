@@ -60,6 +60,49 @@ class MAETests(unittest.TestCase):
                     mae.init_wandb(args, output, manifest, "hash", partitions, "cpu")
                 run.finish.assert_called_with(exit_code=1)
 
+    def test_reconstruction_metrics_use_hidden_voxels_and_foreground(self):
+        target = torch.zeros(1, 1, 16, 16, 16)
+        mask = torch.zeros(1, 1, 2, 2, 2)
+        mask[:, :, 0] = 1
+        foreground = torch.zeros_like(target)
+        foreground[:, :, :4] = 1
+        prediction = torch.full_like(target, 100)
+        prediction[:, :, :4] = 2
+        prediction[:, :, 4:8] = 4
+        metrics = mae.reconstruction_totals(prediction, target, mask, foreground)
+        self.assertAlmostEqual(metrics["masked_mse"][0] / metrics["masked_mse"][1], 10)
+        self.assertAlmostEqual(metrics["masked_mae"][0] / metrics["masked_mae"][1], 3)
+        self.assertAlmostEqual(metrics["foreground_masked_mse"][0] / metrics["foreground_masked_mse"][1], 4)
+        perfect = mae.reconstruction_totals(target, target, mask, foreground, ssim_data_range=10)
+        self.assertGreater(perfect["masked_ssim"][1], 0)
+        self.assertAlmostEqual(perfect["masked_ssim"][0] / perfect["masked_ssim"][1], 1)
+        # Altering visible voxels cannot affect SSIM on fully hidden windows.
+        prediction = target.clone()
+        prediction[:, :, 8:] = 100
+        unchanged = mae.reconstruction_totals(prediction, target, mask, foreground, ssim_data_range=10)
+        self.assertEqual(unchanged["masked_ssim"], perfect["masked_ssim"])
+        empty = mae.reconstruction_totals(target, target, mask, torch.zeros_like(target))
+        self.assertEqual(empty["foreground_masked_mse"][1], 0)
+
+    def test_validation_groups_and_fixed_masks_are_reproducible(self):
+        class ZeroModel(torch.nn.Module):
+            def forward(self, image, mask):
+                return torch.zeros_like(image)
+        args = Namespace(seed=42, block=32, mask_ratio=None, mask_range=(0.6, 0.9),
+                         val_mask_ratios=(0.6, 0.75, 0.9), ssim_data_range=10)
+        x = torch.stack([torch.ones(1, 64, 64, 64), torch.full((1, 64, 64, 64), 2.)])
+        loader = [{"image": x, "valid": torch.ones_like(x), "sequence": ["PRE", "FLAIR"]}]
+        model = ZeroModel()
+        metrics = mae.validate(model, loader, torch.device("cpu"), args)
+        self.assertEqual(metrics, mae.validate(model, loader, torch.device("cpu"), args))
+        self.assertAlmostEqual(metrics["val/masked_mse"], 2.5)
+        self.assertAlmostEqual(metrics["val/masked_mae"], 1.5)
+        self.assertAlmostEqual(metrics["val/sequence_PRE/masked_mse"], 1)
+        self.assertAlmostEqual(metrics["val/sequence_FLAIR/masked_mse"], 4)
+        for ratio in args.val_mask_ratios:
+            self.assertAlmostEqual(metrics[f"val/mask_ratio_{ratio:g}/masked_mse"], 2.5)
+            self.assertTrue(np.isfinite(metrics[f"val/mask_ratio_{ratio:g}/masked_ssim"]))
+
     def test_paper_mask_grid_and_hidden_counts(self):
         x = torch.empty(2, 1, 160, 160, 160)
         for ratio in (0.6, 0.75, 0.9):
@@ -238,7 +281,11 @@ class MAETests(unittest.TestCase):
                     result = dataset[0]
                     self.assertEqual(result["image"].shape, (1, 64, 64, 64))
                     self.assertTrue(torch.isfinite(result["image"]).all())
-                    self.assertNotIn("valid", result)
+                    if training:
+                        self.assertNotIn("valid", result)
+                    else:
+                        self.assertEqual(result["valid"].shape, result["image"].shape)
+                        self.assertEqual(set(result["valid"].unique().tolist()), {0.0, 1.0})
             manifest = {
                 "revision": "synthetic-only",
                 "sequences": ["PRE"],
@@ -274,6 +321,7 @@ class MAETests(unittest.TestCase):
                 val_volumes=0,
             )
             original_save = mae.save_checkpoint
+            tracking_run = MagicMock()
 
             def capture_first_step(path, *positional):
                 original_save(path, *positional)
@@ -282,9 +330,18 @@ class MAETests(unittest.TestCase):
 
             with (
                 patch.object(mae, "save_checkpoint", side_effect=capture_first_step),
+                patch.object(mae, "init_wandb", return_value=tracking_run),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 mae.train(args)
+            payloads = [call.args[0] for call in tracking_run.log.call_args_list]
+            self.assertTrue(any("train/masked_mae" in payload for payload in payloads))
+            validation = next(payload for payload in payloads if "val/masked_mse" in payload)
+            for key in ("val/masked_mae", "val/foreground_masked_mse", "val/masked_ssim",
+                        "val/mask_ratio_0.75/masked_mse", "val/sequence_unknown/masked_mse"):
+                self.assertIn(key, validation)
+                self.assertTrue(np.isfinite(validation[key]))
+            tracking_run.finish.assert_called_once_with(exit_code=0)
             state = torch.load(output / "last.pt", weights_only=True)
             self.assertEqual(state["step"], 2)
             self.assertTrue(np.isfinite(state["val_loss"]))
