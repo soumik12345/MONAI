@@ -15,10 +15,13 @@ import json
 import math
 import random
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from datasets import load_dataset
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import disable_progress_bars
+from tqdm.auto import tqdm
 
 REPO = "geekyrakshit/Yale-Brain-Mets-Longitudinal"
 SEQUENCES = ("PRE", "POST", "T2", "FLAIR")
@@ -96,11 +99,26 @@ def prepare(args):
         f"excluded {dict(excluded)}.",
         flush=True,
     )
-    for i, row in enumerate(chosen, 1):
-        path = hf_hub_download(REPO, row["nifti_path"], repo_type="dataset", revision=revision)
+    # Keep catalog progress visible; suppress per-file Hub/Xet download bars.
+    disable_progress_bars()
+    paths = [None] * len(chosen)
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(hf_hub_download, REPO, row["nifti_path"], repo_type="dataset", revision=revision): i
+            for i, row in enumerate(chosen)
+        }
+        with tqdm(total=len(chosen), desc="Downloading volumes", unit="volume") as progress:
+            try:
+                for future in as_completed(futures):
+                    paths[futures[future]] = future.result()
+                    progress.update(1)
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+    # Completion order varies with concurrency; retain the original catalog order.
+    for row, path in zip(chosen, paths):
         partitions[assignment[row["patient_id"]]].append({**row, "image": path})
-        if i % 25 == 0 or i == len(chosen):
-            print(f"Downloaded {i}/{len(chosen)}", flush=True)
     manifest = {"repo": REPO, "revision": revision, "sequences": sequences, "seed": args.seed, "partitions": partitions}
     manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"Saved {manifest_path}. Keep this split for downstream evaluation too.")
@@ -114,10 +132,13 @@ def main():
     sequences.add_argument("--sequences", choices=SEQUENCES, nargs="+", default=list(SEQUENCES))
     parser.add_argument("--revision", default=None, help="Dataset revision; resolved to an immutable commit")
     parser.add_argument("--max-patients", type=int, default=0, help="0 uses all eligible patients")
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent file downloads (default: 8)")
     parser.add_argument("--seed", type=int, default=42, help="Seed for patient-level split")
     args = parser.parse_args()
     if args.max_patients < 0:
         parser.error("max-patients must be nonnegative")
+    if args.workers < 1:
+        parser.error("workers must be at least 1")
     prepare(args)
 
 

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import nibabel as nib
 import numpy as np
@@ -28,6 +28,37 @@ class MAETests(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(7)
+
+    def test_wandb_optional_and_resume_identity(self):
+        self.assertIsNone(mae.init_wandb(Namespace(wandb=False), None, None, None, None, None))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            args = Namespace(wandb=True, resume=False, wandb_project="test-project", wandb_entity=None,
+                             wandb_name="test", wandb_mode="online", batch_size=1, accumulation=6)
+            sdk = MagicMock(spec=["init"])
+            run = sdk.init.return_value
+            run.id, run.project, run.entity = "run-id", "test-project", "test-entity"
+            manifest = {"revision": "commit", "sequences": ["PRE"]}
+            partitions = {"train": [{"patient_id": "p1"}, {"patient_id": "p1"}]}
+            with patch.object(mae, "wandb", sdk):
+                self.assertIs(mae.init_wandb(args, output, manifest, "hash", partitions, "cpu"), run)
+                self.assertRegex(sdk.init.call_args.kwargs["id"], r"^[0-9a-f]{32}$")
+                config = sdk.init.call_args.kwargs["config"]
+                self.assertEqual(config["effective_batch"], 6)
+                self.assertEqual(config["split_patients"], {"train": 1})
+                self.assertEqual(config["manifest_sha256"], "hash")
+                args.resume = True
+                mae.init_wandb(args, output, manifest, "hash", partitions, "cpu")
+                self.assertEqual(sdk.init.call_args.kwargs["id"], "run-id")
+                self.assertEqual(sdk.init.call_args.kwargs["resume"], "allow")
+                self.assertEqual(sdk.init.call_args.kwargs["entity"], "test-entity")
+                args.wandb_mode = "offline"
+                mae.init_wandb(args, output, manifest, "hash", partitions, "cpu")
+                self.assertIsNone(sdk.init.call_args.kwargs["resume"])
+                run.define_metric.side_effect = RuntimeError("setup failed")
+                with self.assertRaisesRegex(RuntimeError, "setup failed"):
+                    mae.init_wandb(args, output, manifest, "hash", partitions, "cpu")
+                run.finish.assert_called_with(exit_code=1)
 
     def test_paper_mask_grid_and_hidden_counts(self):
         x = torch.empty(2, 1, 160, 160, 160)
@@ -182,6 +213,7 @@ class MAETests(unittest.TestCase):
                 sequences=["PRE", "POST", "T2", "FLAIR"],
                 seed=42,
                 max_patients=0,
+                workers=4,
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 preparation.prepare(args)

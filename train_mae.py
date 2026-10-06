@@ -6,6 +6,7 @@ Prepare the dataset with prepare_mae.py before training.
     python prepare_mae.py --output ./yale_mae --max-patients 20
     python train_mae.py train --output ./yale_mae --batch-size 1 --accumulation 6
     python train_mae.py train --output ./yale_mae --batch-size 1 --accumulation 6 --resume
+    python train_mae.py train --output ./yale_mae --wandb --wandb-project yale-mae
     python train_mae.py export --output ./yale_mae --out-channels 2
     python train_mae.py smoke-test
     python train_mae.py smoke-test --device cuda --augmentation-backend batchaug
@@ -44,10 +45,14 @@ import json
 import math
 import random
 from pathlib import Path
+from uuid import uuid4
 
+import batchaug
+import wandb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from torch.utils.data import RandomSampler
 from monai.networks.nets import DynUNet
@@ -294,12 +299,6 @@ def make_transforms(roi, training, augmentation_backend="monai"):
 
 def make_batch_augmenter():
     """Use BatchAug only on training batches after transfer to CUDA."""
-    try:
-        import batchaug
-    except ImportError as exc:
-        raise RuntimeError(
-            "Install BatchAug from https://github.com/halleewong/batchaug " "to use --augmentation-backend batchaug."
-        ) from exc
     return batchaug.Compose(
         transforms=[
             batchaug.RandAffined(
@@ -413,6 +412,50 @@ def check_resume(state, args, manifest_hash):
         raise ValueError("Resume requires the original --augmentation-backend setting.")
 
 
+def init_wandb(args, output, manifest, manifest_hash, partitions, device):
+    """Optional tracking; keep the run identity alongside local checkpoints."""
+    if not getattr(args, "wandb", False):
+        return None
+    identity_path = output / "wandb_run.json"
+    identity = json.loads(identity_path.read_text()) if args.resume and identity_path.exists() else None
+    project = args.wandb_project
+    entity = args.wandb_entity
+    if identity:
+        if identity["project"] != project or (entity is not None and identity["entity"] != entity):
+            raise ValueError("Resume W&B with the original project and entity.")
+        entity = identity["entity"]
+    config = {
+        **vars(args),
+        "dataset_revision": manifest["revision"],
+        "manifest_sha256": manifest_hash,
+        "sequences": manifest.get("sequences", [manifest.get("sequence", "unknown")]),
+        "effective_batch": args.batch_size * args.accumulation,
+        "resolved_device": str(device),
+        "split_volumes": {name: len(rows) for name, rows in partitions.items()},
+        "split_patients": {name: len({r["patient_id"] for r in rows}) for name, rows in partitions.items()},
+    }
+    run = wandb.init(
+        project=project,
+        entity=entity,
+        name=args.wandb_name,
+        id=identity["id"] if identity else uuid4().hex,
+        resume="allow" if args.wandb_mode == "online" and identity else None,
+        mode=args.wandb_mode,
+        dir=str(output.resolve()),
+        save_code=True,
+        config=config,
+    )
+    try:
+        run.define_metric("optimizer_step")
+        run.define_metric("train/*", step_metric="optimizer_step")
+        run.define_metric("val/*", step_metric="optimizer_step")
+        identity_path.write_text(json.dumps({"id": run.id, "project": run.project, "entity": run.entity}, indent=2))
+    except BaseException:
+        run.finish(exit_code=1)
+        raise
+    return run
+
+
 def train(args):
     set_determinism(seed=args.seed)
     output = Path(args.output)
@@ -502,81 +545,110 @@ def train(args):
             indent=2,
         )
     )
-    batches = iter(train_loader)
-    total, logged_steps = 0.0, 0
-    while completed < args.steps:
-        model.train()
-        lr = poly_lr(args.lr, completed, args.steps, args.poly_power)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
-        optimizer.zero_grad(set_to_none=True)
-        # Share a ratio across the whole effective batch so accumulation uses the
-        # same masked-voxel weighting as a physical batch of six.
-        ratio = draw_mask_ratio(args, mask_generator, device)
-        step_loss = 0.0
-        for _ in range(args.accumulation):
-            try:
-                batch = next(batches)
-            except StopIteration:
-                # Needed only if AMP skipped optimizer updates on overflow.
-                batches = iter(train_loader)
-                batch = next(batches)
-            x = batch["image"].to(device, non_blocking=True)
-            if batch_augmenter is not None:
-                x = batch_augmenter({"image": x})["image"]
-            mask = block_mask(x, args.block, ratio, mask_generator, coarse=True)
-            with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
-                loss = masked_mse(model(x, mask), x, mask)
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Nonfinite reconstruction loss; inspect the current volumes.")
-            scaler.scale(loss / args.accumulation).backward()
-            step_loss += loss.item() / args.accumulation
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        previous_scale = scaler.get_scale()
-        scaler.step(optimizer)
-        scaler.update()
-        if scaler.get_scale() < previous_scale:
-            print("AMP overflow: retrying this optimizer step with a reduced scale.", flush=True)
-            continue
-        completed += 1
-        total += step_loss
-        logged_steps += 1
-        if completed % args.log_every == 0 or completed == args.steps:
-            print(f"Step {completed}/{args.steps}: train={total / logged_steps:.5f}, lr={lr:.6g}", flush=True)
+    wandb_run = init_wandb(args, output, manifest, manifest_hash, partitions, device)
+    exit_code = 0
+    try:
+        with tqdm(total=args.steps, initial=completed, desc="Training", unit="update", dynamic_ncols=True) as progress:
+            batches = iter(train_loader)
             total, logged_steps = 0.0, 0
-        if completed % args.validate_every == 0 or completed == args.steps:
-            val_loss = validate(model, val_loader, device, args)
-            print(f"Step {completed}: validation masked MSE={val_loss:.5f}", flush=True)
-            if val_loss < best:
-                best = val_loss
-                save_checkpoint(
-                    output / "best.pt",
-                    model,
-                    optimizer,
-                    scaler,
-                    args,
-                    manifest_hash,
-                    completed,
-                    best,
-                    val_loss,
-                    mask_generator,
-                    data_generator,
-                )
-        if completed % args.save_every == 0 or completed == args.steps:
-            save_checkpoint(
-                last,
-                model,
-                optimizer,
-                scaler,
-                args,
-                manifest_hash,
-                completed,
-                best,
-                val_loss,
-                mask_generator,
-                data_generator,
-            )
+            while completed < args.steps:
+                model.train()
+                lr = poly_lr(args.lr, completed, args.steps, args.poly_power)
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
+                optimizer.zero_grad(set_to_none=True)
+                # Share a ratio across the whole effective batch so accumulation uses the
+                # same masked-voxel weighting as a physical batch of six.
+                ratio = draw_mask_ratio(args, mask_generator, device)
+                step_loss = 0.0
+                for _ in range(args.accumulation):
+                    try:
+                        batch = next(batches)
+                    except StopIteration:
+                        # Needed only if AMP skipped optimizer updates on overflow.
+                        batches = iter(train_loader)
+                        batch = next(batches)
+                    x = batch["image"].to(device, non_blocking=True)
+                    if batch_augmenter is not None:
+                        x = batch_augmenter({"image": x})["image"]
+                    mask = block_mask(x, args.block, ratio, mask_generator, coarse=True)
+                    with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                        loss = masked_mse(model(x, mask), x, mask)
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError("Nonfinite reconstruction loss; inspect the current volumes.")
+                    scaler.scale(loss / args.accumulation).backward()
+                    step_loss += loss.item() / args.accumulation
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                previous_scale = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                if scaler.get_scale() < previous_scale:
+                    tqdm.write("AMP overflow: retrying this optimizer step with a reduced scale.")
+                    continue
+                completed += 1
+                progress.update(1)
+                total += step_loss
+                logged_steps += 1
+                if completed % args.log_every == 0 or completed == args.steps:
+                    progress.set_postfix(train_loss=f"{total / logged_steps:.5f}", lr=f"{lr:.6g}")
+                    tqdm.write(f"Step {completed}/{args.steps}: train={total / logged_steps:.5f}, lr={lr:.6g}")
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "optimizer_step": completed,
+                                "train/masked_mse": total / logged_steps,
+                                "train/lr": lr,
+                                "train/mask_ratio": ratio,
+                            }
+                        )
+                    total, logged_steps = 0.0, 0
+                if completed % args.validate_every == 0 or completed == args.steps:
+                    val_loss = validate(model, val_loader, device, args)
+                    tqdm.write(f"Step {completed}: validation masked MSE={val_loss:.5f}")
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "optimizer_step": completed,
+                                "val/masked_mse": val_loss,
+                                "val/best_masked_mse": min(best, val_loss),
+                            }
+                        )
+                    if val_loss < best:
+                        best = val_loss
+                        save_checkpoint(
+                            output / "best.pt",
+                            model,
+                            optimizer,
+                            scaler,
+                            args,
+                            manifest_hash,
+                            completed,
+                            best,
+                            val_loss,
+                            mask_generator,
+                            data_generator,
+                        )
+                if completed % args.save_every == 0 or completed == args.steps:
+                    save_checkpoint(
+                        last,
+                        model,
+                        optimizer,
+                        scaler,
+                        args,
+                        manifest_hash,
+                        completed,
+                        best,
+                        val_loss,
+                        mask_generator,
+                        data_generator,
+                    )
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish(exit_code=exit_code)
 
 
 def export(args):
@@ -669,7 +741,12 @@ def main():
     parser.add_argument("--validate-every", type=int, default=1000)
     parser.add_argument("--val-volumes", type=int, default=25, help="Fixed validation subset; 0 uses all")
     parser.add_argument("--save-every", type=int, default=1000)
-    parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument("--log-every", type=int, default=1)
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases metric logging")
+    parser.add_argument("--wandb-project", default="yale-mae")
+    parser.add_argument("--wandb-entity", default=None, help="W&B user or team (default: account default)")
+    parser.add_argument("--wandb-name", default=None, help="Optional W&B run display name")
+    parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--checkpoint", default=None, help="Checkpoint to export (default OUTPUT/last.pt)")
