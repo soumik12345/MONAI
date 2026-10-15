@@ -225,7 +225,7 @@ class MaskedAutoEncoderDynUnet(nn.Module):
 
         blocks = [self.backbone.input_block, *self.backbone.downsamples, self.backbone.bottleneck]
         visible = 1 - mask
-        visible_in = F.interpolate(mask.float(), size=tuple(x.shape[2:]), mode="nearest")
+        visible_in = F.interpolate(visible.float(), size=tuple(x.shape[2:]), mode="nearest")
 
         features = []
         for block, stride in zip(blocks, self.strides):
@@ -233,7 +233,7 @@ class MaskedAutoEncoderDynUnet(nn.Module):
                 input=visible.float(), size=tuple(s // t for s, t in zip(x.shape[2:], stride)), mode="nearest"
             )
             x = (
-                checkpoint(_masked_resblock, block, x, visible_in, visible_out)
+                checkpoint(_masked_resblock, block, x, visible_in, visible_out, use_reentrant=False)
                 if self.enable_activation_checkpointing and self.training and torch.is_grad_enabled()
                 else _masked_resblock(block, x, visible_in, visible_out)
             )
@@ -271,7 +271,7 @@ class MaskedAutoEncoderDynUnet(nn.Module):
         ):
             visible = F.interpolate((1 - mask).float(), size=tuple(feature.shape[2:]), mode="nearest")
             dense.append(
-                checkpoint(_densify, feature, visible, norm, token, projection)
+                checkpoint(_densify, feature, visible, norm, token, projection, use_reentrant=False)
                 if self.enable_activation_checkpointing and self.training and torch.is_grad_enabled()
                 else _densify(feature, visible, norm, token, projection)
             )
@@ -279,7 +279,7 @@ class MaskedAutoEncoderDynUnet(nn.Module):
         out = dense[-1]
         for block, skip in zip(self.backbone.upsamples, dense[:-1][::-1]):
             out = (
-                checkpoint(block, out, skip)
+                checkpoint(block, out, skip, use_reentrant=False)
                 if self.enable_activation_checkpointing and self.training and torch.is_grad_enabled()
                 else block(out, skip)
             )

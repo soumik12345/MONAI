@@ -22,6 +22,7 @@ class WandbConfig:
     project: str
     entity: str | None = None
     run_name: str | None = None
+    mode: str = "online"
 
 
 @dataclass
@@ -45,6 +46,7 @@ class MAETrainerConfig:
     mask_range: tuple[float, float] = (0.6, 0.9)
     grad_clip: float = 12.0
     steps: int | None = None
+    epochs: int | None = None
     poly_power: float = 0.9
     log_every: int = 1
     validate_every: int = 50
@@ -74,6 +76,10 @@ class MAETrainerConfig:
             isinstance(self.steps, bool) or not isinstance(self.steps, int) or self.steps <= 0
         ):
             raise ValueError("steps must be a positive integer or None.")
+        if self.epochs is not None and (
+            isinstance(self.epochs, bool) or not isinstance(self.epochs, int) or self.epochs <= 0
+        ):
+            raise ValueError("epochs must be a positive integer or None.")
         if any(not 0 < ratio < 1 for ratio in self.val_mask_ratios):
             raise ValueError("val_mask_ratios must be strictly between 0 and 1.")
         for name in ("grad_clip", "poly_power", "ssim_data_range"):
@@ -169,6 +175,8 @@ class MAETrainer(ABC):
             project=self.config.wandb_config.project,
             entity=self.config.wandb_config.entity,
             name=self.config.wandb_config.run_name,
+            mode=self.config.wandb_config.mode,
+            dir=str(self.output_dir.resolve()),
             save_code=True,
             config=asdict(self.config),
         )
@@ -195,6 +203,46 @@ class MAETrainer(ABC):
     def get_training_steps(self) -> int:
         raise NotImplementedError("MAETrainer.get_training_steps should be implemented by a subclass")
 
+    def _training_batches(self):
+        """Yield an accumulation group, without crossing an epoch boundary.
+
+        Epoch mode retains the group until a successful update, so an AMP
+        overflow retries the same volumes instead of consuming another group.
+        Partial groups are weighted by their actual number of samples.
+        """
+        batches = getattr(self, "_train_batches", None)
+        if batches is None:
+            batches = iter(self.dataloader)
+            self._train_batches = batches
+
+        epoch_mode = self.config.epochs is not None
+        group = getattr(self, "_pending_epoch_batches", None) if epoch_mode else None
+        if group is None:
+            group = []
+            for _ in range(self.config.gradient_accumualtion_steps):
+                try:
+                    batch = next(batches)
+                except StopIteration:
+                    if epoch_mode and group:
+                        break
+                    batches = iter(self.dataloader)
+                    self._train_batches = batches
+                    try:
+                        batch = next(batches)
+                    except StopIteration as error:
+                        raise ValueError("The training dataloader is empty.") from error
+                if epoch_mode:
+                    group.append(batch)
+                else:
+                    yield batch, 1 / self.config.gradient_accumualtion_steps
+            if not epoch_mode:
+                return
+            self._pending_epoch_batches = group
+
+        sample_count = sum(batch["image"].shape[0] for batch in group)
+        for batch in group:
+            yield batch, batch["image"].shape[0] / sample_count
+
     def train_step(
         self,
         *,
@@ -212,24 +260,8 @@ class MAETrainer(ABC):
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        # Retain the iterator across calls so every update consumes new batches.
-        batches = getattr(self, "_train_batches", None)
-        if batches is None:
-            batches = iter(self.dataloader)
-            self._train_batches = batches
-
         step_loss, step_mae = 0.0, 0.0
-        for _ in range(self.config.gradient_accumualtion_steps):
-            try:
-                batch = next(batches)
-            except StopIteration:
-                batches = iter(self.dataloader)
-                self._train_batches = batches
-                try:
-                    batch = next(batches)
-                except StopIteration as error:
-                    raise ValueError("The training dataloader is empty.") from error
-
+        for batch, weight in self._training_batches():
             x = batch["image"].to(self.device, non_blocking=True)
             if batch_augmenter is not None:
                 x = batch_augmenter({"image": x})["image"]
@@ -240,24 +272,27 @@ class MAETrainer(ABC):
                 loss = ((prediction.float() - x.float()).square() * hidden).sum() / hidden_count
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite reconstruction loss; inspect the current volumes.")
-            self.scaler.scale(loss / self.config.gradient_accumualtion_steps).backward()
-            step_loss += loss.item() / self.config.gradient_accumualtion_steps
+            self.scaler.scale(loss * weight).backward()
+            step_loss += loss.item() * weight
             with torch.no_grad():
                 step_mae += (
                     ((prediction.detach().float() - x.float()).abs() * hidden).sum() / hidden_count
-                ).item() / self.config.gradient_accumualtion_steps
+                ).item() * weight
 
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
         previous_scale = self.scaler.get_scale()
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        skipped = self.scaler.get_scale() < previous_scale
+        if not skipped:
+            self._pending_epoch_batches = None
         return {
             "train/masked_mse": step_loss,
             "train/masked_mae": step_mae,
             "train/lr": float(self.optimizer.param_groups[0]["lr"]),
             "train/mask_ratio": mask_ratio,
-            "optimizer_step_skipped": self.scaler.get_scale() < previous_scale,
+            "optimizer_step_skipped": skipped,
         }
 
     @torch.no_grad()
@@ -338,6 +373,8 @@ class MAETrainer(ABC):
             raise ValueError("Resume requires an MAETrainer checkpoint.")
         if state["total_steps"] != self._total_steps:
             raise ValueError("Resume requires the original training step budget.")
+        if state["config"].get("epochs") != self.config.epochs:
+            raise ValueError("Resume requires the original epoch schedule.")
         config = asdict(self.config)
         for key in (
             "dataloader_config",
@@ -360,9 +397,21 @@ class MAETrainer(ABC):
         self.mask_generator.set_state(state["mask_rng"])
         self.data_generator.set_state(state["data_rng"])
         self._train_batches = None
+        self._pending_epoch_batches = None
         return state["step"], state["best_val_loss"], state["val_loss"]
 
     def train(self, *, batch_augmenter: Any = None) -> None:
+        exit_code = 0
+        try:
+            self._train(batch_augmenter=batch_augmenter)
+        except BaseException:
+            exit_code = 1
+            raise
+        finally:
+            if self.run is not None:
+                self.run.finish(exit_code=exit_code)
+
+    def _train(self, *, batch_augmenter: Any = None) -> None:
         total_steps = self.config.steps
         if total_steps is None:
             total_steps = self.get_training_steps()
@@ -382,6 +431,7 @@ class MAETrainer(ABC):
         if steps_completed >= total_steps:
             return
         self._train_batches = None
+        self._pending_epoch_batches = None
         total_mse, total_mae, logged_steps = 0.0, 0.0, 0
         with tqdm(total=total_steps, initial=steps_completed, desc="Training", unit="update") as progress:
             while steps_completed < total_steps:
@@ -439,5 +489,3 @@ class MAETrainer(ABC):
                         best=best_validation_loss,
                         val_loss=val_loss,
                     )
-        if self.run is not None:
-            self.run.finish()
