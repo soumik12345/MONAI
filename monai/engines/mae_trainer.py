@@ -11,23 +11,6 @@ import wandb
 import torch.nn.functional as F
 
 from monai.bundle import ConfigComponent
-from monai.transforms import (
-    CenterSpatialCropd,
-    Compose,
-    CropForegroundd,
-    DeleteItemsd,
-    EnsureChannelFirstd,
-    EnsureTyped,
-    LoadImaged,
-    MapTransform,
-    NormalizeIntensityd,
-    Orientationd,
-    RandAffined,
-    RandFlipd,
-    RandSpatialCropd,
-    Spacingd,
-    SpatialPadd,
-)
 
 if TYPE_CHECKING:
     from monai.networks.nets import MaskedAutoEncoderDynUnet
@@ -99,23 +82,6 @@ class MAETrainerConfig:
                 raise ValueError(f"{name} must be finite and positive.")
 
 
-class AddValidd(MapTransform):
-    def __call__(self, data):
-        d = dict(data)
-        image = d["image"]
-        if image.ndim != 4 or image.shape[0] != 1:
-            raise ValueError("Expected a scalar 3D MRI volume.")
-        if not torch.isfinite(image).all():
-            raise ValueError("Nonfinite MRI intensities.")
-        d["valid"] = (image != 0).float()
-        if not d["valid"].any():
-            raise ValueError("Empty foreground.")
-        foreground = image[image != 0]
-        if foreground.min() == foreground.max():
-            raise ValueError("Constant foreground intensity.")
-        return d
-
-
 def _check_manifest(manifest):
     partitions = manifest["partitions"]
     patient_sets = {key: {row["patient_id"] for row in rows} for key, rows in partitions.items()}
@@ -126,44 +92,6 @@ def _check_manifest(manifest):
         if patient_sets[a] & patient_sets[b]:
             raise ValueError(f"Patient leakage between {a} and {b}.")
     return partitions
-
-
-def make_transforms(self, roi, training, augmentation_backend="monai"):
-    keys = ["image", "valid"]
-    transforms: list[MapTransform] = [
-        LoadImaged("image", reader="NibabelReader"),
-        EnsureChannelFirstd("image", channel_dim="no_channel"),
-        Orientationd("image", axcodes="RAS", labels=(("L", "R"), ("P", "A"), ("I", "S"))),
-        Spacingd("image", pixdim=(1.0, 1.0, 1.0), mode="bilinear"),
-        AddValidd("image"),
-        CropForegroundd(keys, source_key="valid", margin=4, allow_smaller=True),
-        NormalizeIntensityd("image", nonzero=True, channel_wise=True),
-    ]
-    if training:
-        transforms.append(DeleteItemsd("valid"))
-    transforms += [
-        SpatialPadd("image" if training else keys, spatial_size=roi),
-    ]
-    if training:
-        transforms.append(RandSpatialCropd("image", roi_size=roi, random_size=False))
-        if augmentation_backend == "monai":
-            transforms += [
-                RandAffined(
-                    "image",
-                    prob=0.2,
-                    spatial_size=roi,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    rotate_range=(math.radians(10),) * 3,
-                    scale_range=(0.1,) * 3,
-                ),
-                *[RandFlipd("image", prob=0.5, spatial_axis=axis) for axis in range(3)],
-            ]
-        elif augmentation_backend != "batchaug":
-            raise ValueError(f"Unknown augmentation backend: {augmentation_backend}")
-    else:
-        transforms += [CenterSpatialCropd(keys, roi_size=roi)]
-    return Compose(transforms + [EnsureTyped("image" if training else keys, dtype=torch.float32, track_meta=False)])
 
 
 def reconstruction_totals(prediction, target, mask, foreground, ssim_data_range=None):
