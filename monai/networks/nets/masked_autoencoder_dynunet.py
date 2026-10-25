@@ -1,14 +1,20 @@
+from __future__ import annotations
+
+import json
 from collections.abc import Sequence
 from math import prod
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .dynunet import DynUNet, UnetResBlock
-from ...utils.misc import ensure_tuple_rep
+from monai.networks.blocks.convolutions import Convolution
+from monai.networks.blocks.dynunet_block import UnetOutBlock, get_conv_layer
+from monai.networks.nets.dynunet import DynUNet, DynUNetSkipLayer, UnetResBlock
+from monai.utils import ensure_tuple_rep, optional_import
 
 
 def _masked_instance_norm(
@@ -103,6 +109,7 @@ class MaskedAutoEncoderDynUnet(nn.Module):
         self.filters = filters
         self.masking_ratio = masking_ratio
         self.enable_activation_checkpointing = enable_activation_checkpointing
+        self._segmentation_mode = False
 
         self.downsample = tuple(prod(stride[d] for stride in self.strides) for d in range(spatial_dims))
 
@@ -120,6 +127,119 @@ class MaskedAutoEncoderDynUnet(nn.Module):
         )
 
         self._init_densification_layers(spatial_dims)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        *,
+        revision: str | None = None,
+        cache_dir: str | Path | None = None,
+        token: str | bool | None = None,
+        local_files_only: bool = False,
+        device: str | torch.device = "cpu",
+        **model_kwargs: Any,
+    ) -> MaskedAutoEncoderDynUnet:
+        load_file, has_safetensors = optional_import("safetensors.torch", name="load_file")
+        if not has_safetensors:
+            raise ImportError("from_pretrained requires safetensors. Install it with `pip install safetensors`.")
+
+        directory = Path(pretrained_model_name_or_path).expanduser()
+        if not directory.is_dir():
+            snapshot_download, has_hub = optional_import("huggingface_hub", name="snapshot_download")
+            if not has_hub:
+                raise ImportError(
+                    "Loading from the Hub requires huggingface_hub. Install it with `pip install huggingface_hub`."
+                )
+            directory = Path(
+                snapshot_download(
+                    repo_id=str(pretrained_model_name_or_path),
+                    repo_type="model",
+                    revision=revision,
+                    cache_dir=cache_dir,
+                    token=token,
+                    local_files_only=local_files_only,
+                    allow_patterns=["config.json", "model.safetensors"],
+                )
+            )
+
+        config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or not isinstance(config.get("model_kwargs"), dict):
+            raise ValueError("config.json must contain a 'model_kwargs' object with model constructor arguments.")
+        model = cls(**{**config["model_kwargs"], **model_kwargs})
+        model.load_state_dict(load_file(str(directory / "model.safetensors"), device="cpu"), strict=True)
+        return model.to(device).eval()
+
+    def add_segmentation_head(
+        self,
+        num_classes: int,
+        *,
+        in_channels: int | None = None,
+        reuse_decoder: bool = False,
+    ) -> MaskedAutoEncoderDynUnet:
+        if self._segmentation_mode:
+            raise RuntimeError("This model already has a segmentation head; conversion can only be performed once.")
+        in_channels = self.in_channels if in_channels is None else in_channels
+        for name, value in (("num_classes", num_classes), ("in_channels", in_channels)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer.")
+        if in_channels != self.in_channels and self.in_channels != 1:
+            raise ValueError("Changing input channels requires a single-channel pretrained MAE.")
+
+        # This MAE always constructs a residual DynUNet. Convolution registers
+        # its concrete Conv2d/Conv3d dynamically, so narrow those types explicitly.
+        stem = cast(UnetResBlock, self.backbone.input_block)
+        input_conv = cast(nn.Conv2d | nn.Conv3d, stem.conv1.conv)
+        reference = input_conv.weight
+        head = UnetOutBlock(self.spatial_dims, self.filters[0], num_classes)
+        head.apply(self.backbone.initialize_weights)
+        head.to(device=reference.device, dtype=reference.dtype)
+        decoder = self.backbone.upsamples
+        if not reuse_decoder:
+            decoder = self.backbone.get_upsamples()
+            decoder.apply(self.backbone.initialize_weights)
+            decoder.to(device=reference.device, dtype=reference.dtype)
+
+        if in_channels != self.in_channels:
+            layers: list[Convolution] = [stem.conv1]
+            if hasattr(stem, "conv3"):
+                layers.append(stem.conv3)
+            else:
+                # A one-feature stem originally used an identity residual.
+                # Average the new input channels to preserve that initialization.
+                projection = get_conv_layer(
+                    self.spatial_dims, in_channels, 1, kernel_size=1, act=None, norm=None, conv_only=False
+                ).to(device=reference.device, dtype=reference.dtype)
+                projection_conv = cast(nn.Conv2d | nn.Conv3d, projection.conv)
+                nn.init.constant_(projection_conv.weight, 1 / in_channels)
+                projection.requires_grad_(reference.requires_grad)
+                stem.conv3 = projection
+                stem.norm3 = nn.Identity()
+                stem.downsample = True
+            repeats = (1, in_channels) + (1,) * self.spatial_dims
+            for layer in layers:
+                convolution = cast(nn.Conv2d | nn.Conv3d, layer.conv)
+                weight = convolution.weight
+                convolution.weight = nn.Parameter(
+                    weight.detach().repeat(*repeats) / in_channels, requires_grad=weight.requires_grad
+                )
+                layer.in_channels = convolution.in_channels = in_channels
+
+        self.backbone.upsamples = decoder
+        # DynUNet registers the same upsampling modules in its skip-layer tree.
+        # Update those aliases so the old decoder has no remaining references.
+        skip_layer = self.backbone.get_submodule("skip_layers")
+        for upsample in reversed(decoder):
+            if not isinstance(skip_layer, DynUNetSkipLayer):
+                raise RuntimeError("Unexpected DynUNet skip-layer topology.")
+            skip_layer.upsample = upsample
+            skip_layer = skip_layer.get_submodule("next_layer")
+        self.backbone.output_block = head
+        self.in_channels = self.backbone.in_channels = in_channels
+        self.out_channels = self.backbone.out_channels = num_classes
+        del self.mask_tokens, self.densify_norms, self.densify_projections
+        self._segmentation_mode = True
+        return self.train(self.training)
 
     def _check_parameters(
         self,
@@ -177,8 +297,9 @@ class MaskedAutoEncoderDynUnet(nn.Module):
         if any(s <= 0 or s % d for s, d in zip(x.shape[2:], self.downsample)):
             raise ValueError(f"Input spatial dimensions must be positive multiples of {self.downsample}.")
         grid = tuple(s // d for s, d in zip(x.shape[2:], self.downsample))
-        if prod(grid) < 3:
-            raise ValueError("The bottleneck grid must contain at least three positions.")
+        minimum = 2 if self._segmentation_mode else 3
+        if prod(grid) < minimum:
+            raise ValueError(f"The bottleneck grid must contain at least {minimum} positions.")
         return grid
 
     def _sample_mask(
@@ -220,6 +341,8 @@ class MaskedAutoEncoderDynUnet(nn.Module):
         return mask
 
     def encode(self, x: torch.Tensor, mask: torch.Tensor):
+        if self._segmentation_mode:
+            raise RuntimeError("Masked encoding is unavailable after segmentation conversion; use forward(x).")
         grid = self._validate_input(x)
         mask = self._validate_mask(mask, x, grid)
 
@@ -242,6 +365,16 @@ class MaskedAutoEncoderDynUnet(nn.Module):
 
         return features
 
+    def _decode(self, features: Sequence[torch.Tensor]) -> torch.Tensor:
+        out = features[-1]
+        for block, skip in zip(self.backbone.upsamples, features[:-1][::-1]):
+            out = (
+                checkpoint(block, out, skip, use_reentrant=False)
+                if self.enable_activation_checkpointing and self.training and torch.is_grad_enabled()
+                else block(out, skip)
+            )
+        return self.backbone.output_block(out)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -251,6 +384,19 @@ class MaskedAutoEncoderDynUnet(nn.Module):
         generator: torch.Generator | None = None,
     ):
         grid = self._validate_input(x)
+
+        if self._segmentation_mode:
+            if masking_ratio is not None or mask is not None or generator is not None:
+                raise ValueError("Masking arguments are not supported after segmentation conversion.")
+            features = []
+            for block in [self.backbone.input_block, *self.backbone.downsamples, self.backbone.bottleneck]:
+                x = (
+                    checkpoint(block, x, use_reentrant=False)
+                    if self.enable_activation_checkpointing and self.training and torch.is_grad_enabled()
+                    else block(x)
+                )
+                features.append(x)
+            return self._decode(features)
 
         if mask is None:
             ratio = self.masking_ratio if masking_ratio is None else masking_ratio
@@ -276,12 +422,4 @@ class MaskedAutoEncoderDynUnet(nn.Module):
                 else _densify(feature, visible, norm, token, projection)
             )
 
-        out = dense[-1]
-        for block, skip in zip(self.backbone.upsamples, dense[:-1][::-1]):
-            out = (
-                checkpoint(block, out, skip, use_reentrant=False)
-                if self.enable_activation_checkpointing and self.training and torch.is_grad_enabled()
-                else block(out, skip)
-            )
-
-        return self.backbone.output_block(out), mask
+        return self._decode(dense), mask
