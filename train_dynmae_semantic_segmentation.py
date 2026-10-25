@@ -1,6 +1,7 @@
 """Train PROTEAS segmentation with a frozen pretrained DyneMAE backbone.
 
 Install: uv pip install huggingface_hub safetensors nibabel scipy
+Optional experiment logging: uv pip install 'trackio>=0.43.0'
 
 Freeze encoder, train a new decoder and output head (default):
     python train_dynmae_semantic_segmentation.py --output ./proteas_decoder
@@ -13,6 +14,10 @@ Use --modalities t1ce for a single-channel input. Use --manifest for an existing
 prepare_segmentation.py manifest/local mirror. By default, train on train and
 validate on validation. Add --train-on-train-val to train on train+validation
 and use test for validation and checkpoint selection.
+
+Add --trackio to log configuration, metrics, and best-checkpoint artifacts.
+Trackio uses local storage by default (configure with TRACKIO_DIR). Pass
+--trackio-space-id username/space to log to a Hugging Face Space instead.
 """
 
 from __future__ import annotations
@@ -48,7 +53,7 @@ from monai.transforms import (
     RandRotate90d,
     SpatialPadd,
 )
-from monai.utils import set_determinism
+from monai.utils import optional_import, set_determinism
 
 DATASET = "geekyrakshit/PROTEAS-Brain-Metastases-Segmentation"
 MODEL = "geekyrakshit/DyneMAE-Yale-Brain-Mets"
@@ -68,6 +73,30 @@ def sha256(path: Path) -> str:
 
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
+
+
+def start_tracking(args: argparse.Namespace, output: Path, recipe: dict[str, Any]):
+    """Initialize optional Trackio logging and retain the run identity for resume."""
+    if not args.trackio:
+        return None
+    trackio, available = optional_import("trackio", version="0.43.0")
+    if not available:
+        raise ImportError("Trackio logging requires `uv pip install 'trackio>=0.43.0'`.")
+    metadata_path = output / "trackio_run.json"
+    previous = json.loads(metadata_path.read_text()) if args.resume and metadata_path.exists() else {}
+    same_project = previous.get("project") == args.trackio_project
+    name = args.trackio_name or (previous.get("name") if same_project else None)
+    space_id = args.trackio_space_id or (previous.get("space_id") if same_project else None)
+    run = trackio.init(
+        project=args.trackio_project,
+        name=name,
+        space_id=space_id,
+        config=recipe,
+        resume="allow" if args.resume else "never",
+        embed=False,
+    )
+    write_json(metadata_path, {"project": args.trackio_project, "name": run.name, "id": run.id, "space_id": space_id})
+    return run
 
 
 def split_sources(args: argparse.Namespace) -> dict[str, list[str]]:
@@ -625,22 +654,25 @@ def parse_args(argv=None) -> argparse.Namespace:
         "defaults to the complete training loader",
     )
     parser.add_argument(
-        "--wandb",
+        "--trackio",
         action="store_true",
-        help="Log the configuration, epoch metrics, and best checkpoint to Weights & Biases (default: disabled)",
+        help="Log configuration, epoch metrics, and best-checkpoint artifacts with Trackio. Uses local storage "
+        "by default; TRACKIO_DIR configures its location (default: disabled)",
     )
     parser.add_argument(
-        "--wandb-project",
+        "--trackio-project",
         default="proteas-segmentation",
-        help="Weights & Biases project used when --wandb is enabled (default: %(default)s)",
+        help="Trackio project used when --trackio is enabled (default: %(default)s)",
     )
     parser.add_argument(
-        "--wandb-entity",
-        help="Weights & Biases user or team owning the run; defaults to the configured W&B entity",
+        "--trackio-space-id",
+        help="Optional Hugging Face Space, such as username/space, for Trackio logging; created if missing. "
+        "If omitted, uses Trackio's environment settings or local storage",
     )
     parser.add_argument(
-        "--wandb-name",
-        help="Display name for the Weights & Biases run; W&B generates a name if omitted",
+        "--trackio-name",
+        help="Trackio run name; generated if omitted on a new run. With --resume, reuses the name saved in "
+        "OUTPUT/trackio_run.json when the project matches",
     )
     args = parser.parse_args(argv)
     for name in ("epochs", "batch_size", "accumulation", "download_workers", "val_every", "sw_batch_size"):
@@ -766,14 +798,8 @@ def main(argv=None) -> None:
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "recipe.json", recipe)
     print(f"Mode: {args.train_mode}; trainable: {trainable:,}; frozen: {frozen:,}; device: {device}", flush=True)
-    run = None
-    if args.wandb:
-        import wandb
-
-        run = wandb.init(
-            project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_name, dir=str(output), config=recipe
-        )
     loss_function = DiceCELoss(to_onehot_y=True, softmax=True, include_background=False)
+    run = start_tracking(args, output, recipe)
     try:
         for epoch in range(start_epoch, args.epochs):
             metrics: dict[str, Any] = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
@@ -809,14 +835,10 @@ def main(argv=None) -> None:
                 stream.write(json.dumps(metrics, allow_nan=False) + "\n")
             print(json.dumps(metrics, allow_nan=False), flush=True)
             if run is not None:
-                run.log(metrics)
+                run.log(metrics, step=epoch + 1)
                 if improved:
-                    run.log_model(path=str(output / "best.pt"))
-    except BaseException:
-        if run is not None:
-            run.finish(exit_code=1)
-        raise
-    else:
+                    run.log_artifact(output / "best.pt", name=f"run-{run.id}-best", type="model", aliases=["best"])
+    finally:
         if run is not None:
             run.finish()
     print(f"Best validation Dice ({evaluation_split}): {best_dice:.6f}; checkpoints: {output}", flush=True)
