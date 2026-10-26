@@ -16,8 +16,20 @@ validate on validation. Add --train-on-train-val to train on train+validation
 and use test for validation and checkpoint selection.
 
 Add --trackio to log configuration, metrics, and best-checkpoint artifacts.
+Training metrics use train/ and validation metrics use val/ in all metric logs.
 Trackio uses local storage by default (configure with TRACKIO_DIR). Pass
 --trackio-space-id username/space to log to a Hugging Face Space instead.
+
+New runs use mild intensity/affine augmentation and class-balanced crops.
+Use --augmentation none for crops without other random augmentations, or
+--augmentation legacy to resume the original tumor/background + flip/90-degree
+pipeline. Validation always uses deterministic preprocessing only.
+
+Download/restore the portable prepared dataset automatically:
+    python train_dynmae_semantic_segmentation.py \
+        --dataset geekyrakshit/PROTEAS-Brain-Metastases-Segmentation-Prepared
+The archive preserves original NIfTIs; deterministic preprocessing still runs
+locally. Add --cache-dir to cache it across epochs and runs.
 """
 
 from __future__ import annotations
@@ -26,6 +38,7 @@ import argparse
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+from itertools import islice
 import json
 import math
 from pathlib import Path
@@ -39,6 +52,7 @@ from huggingface_hub import HfApi, hf_hub_download
 from scipy.ndimage import binary_fill_holes
 from tqdm.auto import tqdm
 
+from archive_proteas_segmentation import ARCHIVE_FORMAT, restore_files, safe_relative
 from monai.data import DataLoader, Dataset, PersistentDataset
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss
@@ -48,8 +62,13 @@ from monai.transforms import (
     Compose,
     EnsureTyped,
     MapTransform,
+    RandAdjustContrastd,
+    RandAffined,
+    RandBiasFieldd,
+    RandCropByLabelClassesd,
     RandCropByPosNegLabeld,
     RandFlipd,
+    RandGaussianNoised,
     RandRotate90d,
     SpatialPadd,
 )
@@ -61,6 +80,14 @@ MODALITIES = ("t1", "t1ce", "t2", "flair")
 LABELS = {"0": "background", "1": "necrotic_core", "2": "enhancing_tumor", "3": "edema"}
 FORMAT = "DynMAESegmentation-v1"
 Case = dict[str, Any]
+LEGACY_AUGMENTATION = {
+    "version": 1,
+    "profile": "legacy",
+    "crop_sampling": "tumor_background",
+    "tumor_background_ratio": [3, 1],
+    "flip_probability": 0.5,
+    "rotate90_probability": 0.2,
+}
 
 
 def sha256(path: Path) -> str:
@@ -154,12 +181,16 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
     # A previously prepared train/validation directory may still need test files.
     # Keep its manifest bytes intact so existing checkpoint signatures stay valid.
     required = sorted(name for name in names if not existing or not (output / name).is_file())
+    checksums: dict[str, str] = {}
     if required:
         revision = manifest.get("revision")
         if not revision:
             raise ValueError("The existing manifest needs missing files but has no pinned dataset revision.")
         repo = manifest.get("repo_id", args.dataset)
         checksum_file = Path(hf_hub_download(repo, "SHA256SUMS", repo_type="dataset", revision=revision))
+        descriptor = manifest.get("prepared_archive")
+        if descriptor and sha256(checksum_file) != descriptor["checksums_sha256"]:
+            raise ValueError("Prepared dataset checksum index SHA-256 mismatch.")
         checksums = {
             name.lstrip(" *"): digest
             for digest, name in (
@@ -169,6 +200,23 @@ def prepare_dataset(args: argparse.Namespace) -> Path:
         downloads = {name: checksums[name] for name in required}
     else:
         downloads = {}
+
+    if downloads and manifest.get("prepared_archive"):
+        descriptor = manifest["prepared_archive"]
+        if descriptor["format"] != ARCHIVE_FORMAT:
+            raise ValueError("Unsupported prepared archive format.")
+        archive_path = Path(
+            hf_hub_download(
+                manifest.get("repo_id", args.dataset),
+                safe_relative(descriptor["filename"]),
+                repo_type="dataset",
+                revision=manifest["revision"],
+            )
+        )
+        restore_files(archive_path, output, manifest, checksums, names=required)
+        if not existing:
+            write_json(destination, manifest)
+        return destination
 
     def fetch(item: tuple[str, str]) -> None:
         name, expected = item
@@ -299,19 +347,119 @@ class LoadProteasCased(MapTransform):
         }
 
 
-def make_transforms(roi: Sequence[int], training: bool) -> Compose:
+class RandGaussianNoiseRanged(RandGaussianNoised):
+    """Dictionary Gaussian noise with standard deviation sampled in [low, high]."""
+
+    def __init__(self, std_range: tuple[float, float], prob: float) -> None:
+        super().__init__(keys="image", prob=prob, std=std_range[1], sample_std=False)
+        self.std_range = std_range
+
+    def randomize(self, data: Any = None) -> None:
+        super().randomize(data)
+        if self._do_transform:
+            self.rand_gaussian_noise.std = float(self.R.uniform(*self.std_range))
+
+
+def augmentation_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Return effective settings, excluding options unused by the chosen profile."""
+    if args.augmentation == "legacy":
+        return dict(LEGACY_AUGMENTATION)
+    enabled = args.augmentation == "mild"
+    config: dict[str, Any] = {
+        "version": 1,
+        "profile": args.augmentation,
+        "crop_sampling": "class_balanced",
+        "class_crop_weights": list(args.class_crop_weights),
+        "max_samples_per_class": 100_000,
+        "flip_probability": 0.5 if enabled else 0.0,
+        "rotate90_probability": 0.2 if enabled else 0.0,
+    }
+    if enabled:
+        config.update(
+            affine_probability=args.affine_prob,
+            rotation_degrees=args.rotation_degrees,
+            scale_range=list(args.scale_range),
+            noise_probability=args.noise_prob,
+            noise_std_range=list(args.noise_std_range),
+            gamma_probability=args.gamma_prob,
+            gamma_range=list(args.gamma_range),
+            gamma_retain_stats=True,
+            bias_probability=args.bias_prob,
+            bias_degree=3,
+            bias_coeff_range=[-args.bias_coeff, args.bias_coeff],
+            spatial_interpolation=["bilinear", "nearest"],
+            spatial_padding="zeros",
+        )
+    return config
+
+
+def make_transforms(roi: Sequence[int], training: bool, augmentation: dict[str, Any] | None = None) -> Compose:
     transforms: list[Any] = [LoadProteasCased()]
     if training:
+        config = augmentation if augmentation is not None else augmentation_config(parse_args([]))
+        crop = (
+            RandCropByPosNegLabeld(
+                keys=("image", "label"), label_key="label", spatial_size=roi, pos=3, neg=1, num_samples=1
+            )
+            if config["profile"] == "legacy"
+            else RandCropByLabelClassesd(
+                keys=("image", "label"),
+                label_key="label",
+                spatial_size=roi,
+                ratios=config["class_crop_weights"],
+                num_classes=4,
+                num_samples=1,
+                warn=False,
+                max_samples_per_class=config["max_samples_per_class"],
+            )
+        )
         transforms.extend(
             [
                 SpatialPadd(keys=("image", "label"), spatial_size=roi),
-                RandCropByPosNegLabeld(
-                    keys=("image", "label"), label_key="label", spatial_size=roi, pos=3, neg=1, num_samples=1
-                ),
-                *[RandFlipd(keys=("image", "label"), prob=0.5, spatial_axis=axis) for axis in range(3)],
-                RandRotate90d(keys=("image", "label"), prob=0.2, spatial_axes=(1, 2)),
+                crop,
             ]
         )
+        if config["profile"] != "none":
+            transforms.extend(
+                [
+                    *[
+                        RandFlipd(keys=("image", "label"), prob=config["flip_probability"], spatial_axis=axis)
+                        for axis in range(3)
+                    ],
+                    RandRotate90d(keys=("image", "label"), prob=config["rotate90_probability"], spatial_axes=(1, 2)),
+                ]
+            )
+        if config["profile"] == "mild":
+            angle = math.radians(config["rotation_degrees"])
+            scales = tuple((config["scale_range"][0] - 1, config["scale_range"][1] - 1) for _ in range(3))
+            transforms.extend(
+                [
+                    RandAffined(
+                        keys=("image", "label"),
+                        spatial_size=roi,
+                        prob=config["affine_probability"],
+                        rotate_range=(angle,) * 3,
+                        scale_range=scales,
+                        mode=("bilinear", "nearest"),
+                        padding_mode="zeros",
+                    ),
+                    RandBiasFieldd(
+                        keys="image",
+                        degree=config["bias_degree"],
+                        coeff_range=tuple(config["bias_coeff_range"]),
+                        prob=config["bias_probability"],
+                    ),
+                    RandAdjustContrastd(
+                        keys="image",
+                        gamma=tuple(config["gamma_range"]),
+                        retain_stats=True,
+                        prob=config["gamma_probability"],
+                    ),
+                    RandGaussianNoiseRanged(
+                        std_range=tuple(config["noise_std_range"]), prob=config["noise_probability"]
+                    ),
+                ]
+            )
     transforms.extend(
         [
             EnsureTyped(keys="image", dtype=torch.float32, track_meta=False),
@@ -369,7 +517,17 @@ def train_epoch(model, loader, optimizer, scaler, loss_function, device, args) -
     batches = min(len(loader), args.max_train_batches or len(loader))
     total, examples = 0.0, 0
     optimizer.zero_grad(set_to_none=True)
-    for index, batch in enumerate(tqdm(loader, total=batches, desc="Train", leave=False)):
+    for index, batch in enumerate(
+        tqdm(
+            islice(loader, batches),
+            total=batches,
+            desc="Train",
+            position=1,
+            leave=False,
+            dynamic_ncols=True,
+            unit="batch",
+        )
+    ):
         inputs = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
@@ -395,8 +553,6 @@ def train_epoch(model, loader, optimizer, scaler, loss_function, device, args) -
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-        if index + 1 == batches:
-            break
     return total / examples
 
 
@@ -415,7 +571,9 @@ def validate(model, loader, device, args) -> dict[str, float | int | None]:
         return prediction.float()
 
     evaluation_split = "+".join(split_sources(args)["validation"])
-    for batch in tqdm(loader, desc=f"Validate ({evaluation_split})", leave=False):
+    for batch in tqdm(
+        loader, desc=f"Validate ({evaluation_split})", position=1, leave=False, dynamic_ncols=True, unit="case"
+    ):
         # Full volumes and stitched logits stay on CPU; only windows go to GPU.
         logits = sliding_window_inference(
             batch["image"],
@@ -479,7 +637,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         default=DATASET,
-        help="Hub dataset ID with the PROTEAS manifest and NIfTI layout (default: %(default)s)",
+        help="Hub dataset ID with the PROTEAS manifest and NIfTIs, or the portable -Prepared archive. "
+        "Prepared archives are downloaded and restored automatically (default: %(default)s)",
     )
     parser.add_argument(
         "--dataset-revision",
@@ -512,7 +671,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--download-workers",
         type=int,
         default=4,
-        help="Number of concurrent NIfTI download/checksum-verification threads (default: %(default)s)",
+        help="Number of concurrent individual NIfTI downloads; prepared archives restore sequentially "
+        "(default: %(default)s)",
     )
     parser.add_argument(
         "--prepare-only",
@@ -551,10 +711,92 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--roi",
         type=int,
         nargs=3,
-        default=(128, 128, 128),
+        default=(160, 160, 160),
         metavar=("D", "H", "W"),
         help="Training crop and validation sliding-window dimensions in voxels, in native Z,Y,X order. "
         "Each dimension must be at least 64 and divisible by 32 (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--augmentation",
+        choices=("mild", "legacy", "none"),
+        default="mild",
+        help="Training augmentation profile: mild adds class-balanced crops, affine, bias field, gamma and noise; "
+        "legacy preserves the original tumor/background crops, flips and 90-degree rotations; "
+        "none keeps class-balanced random crops only. Validation is never augmented (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--class-crop-weights",
+        type=float,
+        nargs=4,
+        default=(1.0, 1.0, 1.0, 1.0),
+        metavar=("BG", "CORE", "ENHANCING", "EDEMA"),
+        help="Positive crop-center weights for labels 0,1,2,3 in mild/none profiles. "
+        "Classes absent from a case are skipped and remaining weights are normalized (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--affine-prob",
+        type=float,
+        default=0.2,
+        help="Probability of a shared image/mask rotation and scaling in the mild profile (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--rotation-degrees",
+        type=float,
+        default=10.0,
+        help="Maximum absolute affine rotation per spatial axis, in degrees, in the mild profile; "
+        "must be in [0,180] (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--scale-range",
+        type=float,
+        nargs=2,
+        default=(0.9, 1.1),
+        metavar=("MIN", "MAX"),
+        help="Positive ordered affine scale factors, sampled independently per axis in the mild profile "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--noise-prob",
+        type=float,
+        default=0.15,
+        help="Probability of adding image-only Gaussian noise in the mild profile (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--noise-std-range",
+        type=float,
+        nargs=2,
+        default=(0.01, 0.05),
+        metavar=("MIN", "MAX"),
+        help="Ordered nonnegative Gaussian-noise standard deviations, sampled uniformly after intensity "
+        "normalization in the mild profile (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--gamma-prob",
+        type=float,
+        default=0.15,
+        help="Probability of image-only gamma contrast adjustment in the mild profile (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--gamma-range",
+        type=float,
+        nargs=2,
+        default=(0.8, 1.2),
+        metavar=("MIN", "MAX"),
+        help="Positive ordered gamma bounds in the mild profile; the transform retains intensity mean "
+        "and standard deviation (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--bias-prob",
+        type=float,
+        default=0.1,
+        help="Probability of a smooth image-only MRI bias field in the mild profile (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--bias-coeff",
+        type=float,
+        default=0.03,
+        help="Nonnegative maximum absolute coefficient of the degree-3 MRI bias field in the mild profile "
+        "(default: %(default)s)",
     )
     parser.add_argument(
         "--lr",
@@ -689,6 +931,21 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("weight-decay must be finite and nonnegative; overlap must be in [0,1)")
     if args.modalities and len(set(args.modalities)) != len(args.modalities):
         parser.error("modalities must be unique")
+    for name in ("affine_prob", "noise_prob", "gamma_prob", "bias_prob"):
+        if not math.isfinite(getattr(args, name)) or not 0 <= getattr(args, name) <= 1:
+            parser.error(f"--{name.replace('_', '-')} must be in [0,1]")
+    for name, allow_zero in (("noise_std_range", True), ("gamma_range", False), ("scale_range", False)):
+        low, high = getattr(args, name)
+        if not (math.isfinite(low) and math.isfinite(high) and low <= high and (low >= 0 if allow_zero else low > 0)):
+            parser.error(
+                f"--{name.replace('_', '-')} requires ordered finite {'nonnegative' if allow_zero else 'positive'} bounds"
+            )
+    if not math.isfinite(args.rotation_degrees) or not 0 <= args.rotation_degrees <= 180:
+        parser.error("--rotation-degrees must be in [0,180]")
+    if not math.isfinite(args.bias_coeff) or args.bias_coeff < 0:
+        parser.error("--bias-coeff must be finite and nonnegative")
+    if any(not math.isfinite(value) or value <= 0 for value in args.class_crop_weights):
+        parser.error("--class-crop-weights must contain four finite positive values")
     return args
 
 
@@ -717,6 +974,7 @@ def main(argv=None) -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; use --device cpu.")
     checkpoint = torch.load(last, map_location="cpu", weights_only=True) if args.resume else None
+    augmentation = augmentation_config(args)
     signature = {
         "manifest_sha256": sha256(manifest_path),
         "channels": manifest["channel_order"],
@@ -734,11 +992,16 @@ def main(argv=None) -> None:
         "max_val_cases": args.max_val_cases,
         "max_train_batches": args.max_train_batches,
         "split_sources": sources,
+        "augmentation": augmentation,
     }
     if checkpoint is not None:
         previous_signature = dict(checkpoint.get("signature", {}))
         # Checkpoints predating the split flag always used train -> validation.
         previous_signature.setdefault("split_sources", {"train": ["train"], "validation": ["validation"]})
+        if "augmentation" not in previous_signature:
+            if args.augmentation != "legacy":
+                raise ValueError("This checkpoint predates augmentation settings; resume with --augmentation legacy.")
+            previous_signature["augmentation"] = dict(LEGACY_AUGMENTATION)
         if checkpoint.get("format") != FORMAT or previous_signature != signature:
             raise ValueError(
                 "Resume requires a matching segmentation checkpoint, manifest, and training configuration."
@@ -748,9 +1011,15 @@ def main(argv=None) -> None:
     generator = torch.Generator().manual_seed(args.seed)
     loaders = {}
     for split in ("train", "validation"):
-        transforms = make_transforms(args.roi, training=split == "train")
+        transforms = make_transforms(args.roi, training=split == "train", augmentation=augmentation)
         if args.cache_dir:
-            cache = args.cache_dir / f"{signature['manifest_sha256'][:16]}-{split}"
+            cache_config = {
+                "manifest": signature["manifest_sha256"],
+                "roi": list(args.roi),
+                "augmentation": augmentation if split == "train" else None,
+            }
+            cache_key = hashlib.sha256(json.dumps(cache_config, sort_keys=True).encode()).hexdigest()[:16]
+            cache = args.cache_dir / f"{cache_key}-{split}"
             dataset = PersistentDataset(partitions[split], transforms, cache_dir=cache)
         else:
             dataset = Dataset(partitions[split], transforms)
@@ -786,9 +1055,11 @@ def main(argv=None) -> None:
         "model_source": model_source,
         "dataset": manifest.get("repo_id", args.dataset),
         "dataset_revision": manifest.get("revision"),
+        "source_dataset": manifest.get("source_dataset"),
         "labels": LABELS,
         "cases": {k: len(v) for k, v in partitions.items()},
         "split_sources": sources,
+        "augmentation": augmentation,
         "trainable_parameters": trainable,
         "frozen_parameters": frozen,
         "preprocessing": "native_ZYX_nonzero_union_crop_per_channel_whole_crop_zscore_1mm",
@@ -801,17 +1072,30 @@ def main(argv=None) -> None:
     loss_function = DiceCELoss(to_onehot_y=True, softmax=True, include_background=False)
     run = start_tracking(args, output, recipe)
     try:
-        for epoch in range(start_epoch, args.epochs):
-            metrics: dict[str, Any] = {"epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"]}
-            metrics["train_loss"] = train_epoch(model, loaders["train"], optimizer, scaler, loss_function, device, args)
+        for epoch in tqdm(
+            range(start_epoch, args.epochs),
+            total=args.epochs,
+            initial=start_epoch,
+            desc="Epochs",
+            position=0,
+            dynamic_ncols=True,
+            unit="epoch",
+        ):
+            metrics: dict[str, Any] = {"epoch": epoch + 1, "train/lr": optimizer.param_groups[0]["lr"]}
+            metrics["train/loss"] = train_epoch(model, loaders["train"], optimizer, scaler, loss_function, device, args)
             improved = False
             if (epoch + 1) % args.val_every == 0 or epoch + 1 == args.epochs:
-                metrics.update(validate(model, loaders["validation"], device, args))
-                metrics["validation_split"] = evaluation_split
-                improved = metrics["mean_dice"] > best_dice
-                best_dice = max(best_dice, metrics["mean_dice"])
+                metrics.update(
+                    {
+                        f"val/{name}": value
+                        for name, value in validate(model, loaders["validation"], device, args).items()
+                    }
+                )
+                metrics["val/split"] = evaluation_split
+                improved = metrics["val/mean_dice"] > best_dice
+                best_dice = max(best_dice, metrics["val/mean_dice"])
             scheduler.step()
-            metrics["best_dice"] = best_dice
+            metrics["val/best_dice"] = best_dice
             state = {
                 "format": FORMAT,
                 "model": model.state_dict(),
@@ -833,7 +1117,7 @@ def main(argv=None) -> None:
                 temporary.replace(target)
             with (output / "metrics.jsonl").open("a") as stream:
                 stream.write(json.dumps(metrics, allow_nan=False) + "\n")
-            print(json.dumps(metrics, allow_nan=False), flush=True)
+            tqdm.write(json.dumps(metrics, allow_nan=False))
             if run is not None:
                 run.log(metrics, step=epoch + 1)
                 if improved:
