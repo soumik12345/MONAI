@@ -1,12 +1,27 @@
-"""Train PROTEAS segmentation with a frozen pretrained DyneMAE backbone.
+"""Train PROTEAS segmentation with a random or pretrained DyneMAE backbone.
 
 Install: uv pip install huggingface_hub safetensors nibabel scipy
 Optional experiment logging: uv pip install 'trackio>=0.43.0'
 
-Freeze encoder, train a new decoder and output head (default):
-    python train_dynmae_semantic_segmentation.py --output ./proteas_decoder
+Train the full model from scratch (default; no pretrained model download):
+    python train_dynmae_semantic_segmentation.py --output ./proteas_scratch
+Freeze a pretrained encoder, train a new decoder and output head:
+    python train_dynmae_semantic_segmentation.py \
+        --model geekyrakshit/DyneMAE-Yale-Brain-Mets --output ./proteas_decoder
 Freeze pretrained encoder AND decoder, train only the output head:
-    python train_dynmae_semantic_segmentation.py --train-mode head --output ./proteas_head
+    python train_dynmae_semantic_segmentation.py \
+        --model geekyrakshit/DyneMAE-Yale-Brain-Mets --train-mode head --output ./proteas_head
+Fine-tune the full pretrained model: encoder, decoder, and output head:
+    python train_dynmae_semantic_segmentation.py \
+        --model geekyrakshit/DyneMAE-Yale-Brain-Mets --train-mode full --reuse-decoder --output ./proteas_full
+With --model, decoder and full modes initialize a new decoder by default.
+Add --reuse-decoder to initialize the trainable decoder with pretrained weights.
+Without --model, all components are randomly initialized and trainable, using
+six stages with filters 32,64,128,256,320,320 and strides 1,2,2,2,2,2.
+--resume restores the saved model and optimizer instead of reinitializing them.
+
+Loss defaults to Dice + cross-entropy. Use --loss dice-focal for foreground
+soft Dice + four-class softmax focal loss (gamma=2), with equal coefficients.
 
 Default channel order: T1, T1ce, T2, FLAIR. With a frozen expanded input stem,
 the repeated/scaled input kernels retain their initial averaging of modalities.
@@ -17,6 +32,7 @@ and use test for validation and checkpoint selection.
 
 Add --trackio to log configuration, metrics, and best-checkpoint artifacts.
 Training metrics use train/ and validation metrics use val/ in all metric logs.
+val/best_dice is logged only after the first validation result is available.
 Trackio uses local storage by default (configure with TRACKIO_DIR). Pass
 --trackio-space-id username/space to log to a Hugging Face Space instead.
 
@@ -55,7 +71,7 @@ from tqdm.auto import tqdm
 from archive_proteas_segmentation import ARCHIVE_FORMAT, restore_files, safe_relative
 from monai.data import DataLoader, Dataset, PersistentDataset
 from monai.inferers import sliding_window_inference
-from monai.losses import DiceCELoss
+from monai.losses import DiceCELoss, DiceLoss, FocalLoss
 from monai.metrics import DiceMetric
 from monai.networks.nets import MaskedAutoEncoderDynUnet
 from monai.transforms import (
@@ -75,7 +91,14 @@ from monai.transforms import (
 from monai.utils import optional_import, set_determinism
 
 DATASET = "geekyrakshit/PROTEAS-Brain-Metastases-Segmentation"
-MODEL = "geekyrakshit/DyneMAE-Yale-Brain-Mets"
+SCRATCH_MODEL_KWARGS = {
+    "spatial_dims": 3,
+    "kernel_size": (3, 3, 3, 3, 3, 3),
+    "strides": (1, 2, 2, 2, 2, 2),
+    "filters": (32, 64, 128, 256, 320, 320),
+    "masking_ratio": 0.75,
+    "enable_activation_checkpointing": True,
+}
 MODALITIES = ("t1", "t1ce", "t2", "flair")
 LABELS = {"0": "background", "1": "necrotic_core", "2": "enhancing_tumor", "3": "edema"}
 FORMAT = "DynMAESegmentation-v1"
@@ -470,9 +493,9 @@ def make_transforms(roi: Sequence[int], training: bool, augmentation: dict[str, 
 
 
 def configure_trainable(model: MaskedAutoEncoderDynUnet, mode: str) -> None:
-    if mode not in ("decoder", "head"):
-        raise ValueError("Training mode must be decoder or head.")
-    model.requires_grad_(False)
+    if mode not in ("decoder", "head", "full"):
+        raise ValueError("Training mode must be decoder, head, or full.")
+    model.requires_grad_(mode == "full")
     model.backbone.output_block.requires_grad_(True)
     if mode == "decoder":
         model.backbone.upsamples.requires_grad_(True)
@@ -480,17 +503,23 @@ def configure_trainable(model: MaskedAutoEncoderDynUnet, mode: str) -> None:
 
 def set_training_mode(model: MaskedAutoEncoderDynUnet, mode: str) -> None:
     model.train()
-    for block in (model.backbone.input_block, model.backbone.downsamples, model.backbone.bottleneck):
-        block.eval()
+    if mode != "full":
+        for block in (model.backbone.input_block, model.backbone.downsamples, model.backbone.bottleneck):
+            block.eval()
     if mode == "head":
         model.backbone.upsamples.eval()
 
 
 def build_model(args: argparse.Namespace, channels: int, checkpoint: dict[str, Any] | None = None):
     if checkpoint is None:
-        local = Path(args.model).is_dir()
-        revision = None if local else HfApi().model_info(args.model, revision=args.model_revision).sha
-        model = MaskedAutoEncoderDynUnet.from_pretrained(args.model, revision=revision, device="cpu")
+        if args.model is None:
+            model = MaskedAutoEncoderDynUnet(in_channels=channels, **SCRATCH_MODEL_KWARGS)
+            source = {"model": None, "revision": None, "initialization": "random"}
+        else:
+            local = Path(args.model).expanduser().is_dir()
+            revision = None if local else HfApi().model_info(args.model, revision=args.model_revision).sha
+            model = MaskedAutoEncoderDynUnet.from_pretrained(args.model, revision=revision, device="cpu")
+            source = {"model": args.model, "revision": revision}
         kwargs = {
             "in_channels": model.in_channels,
             "spatial_dims": model.spatial_dims,
@@ -500,7 +529,6 @@ def build_model(args: argparse.Namespace, channels: int, checkpoint: dict[str, A
             "masking_ratio": model.masking_ratio,
             "enable_activation_checkpointing": True,
         }
-        source = {"model": args.model, "revision": revision}
     else:
         kwargs, source = checkpoint["mae_kwargs"], checkpoint["model_source"]
         model = MaskedAutoEncoderDynUnet(**kwargs)
@@ -510,6 +538,28 @@ def build_model(args: argparse.Namespace, channels: int, checkpoint: dict[str, A
         model.load_state_dict(checkpoint["model"], strict=True)
     configure_trainable(model, args.train_mode)
     return model, kwargs, source
+
+
+class DiceSoftmaxFocalLoss(torch.nn.Module):
+    """Foreground Dice plus softmax focal over all classes, including background."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dice = DiceLoss(to_onehot_y=True, softmax=True, include_background=False)
+        # DiceFocalLoss's softmax option only affects Dice; explicitly select
+        # multiclass softmax focal and retain competition with background here.
+        self.focal = FocalLoss(to_onehot_y=True, use_softmax=True, include_background=True, gamma=2.0)
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        return self.dice(logits, labels) + self.focal(logits, labels)
+
+
+def build_loss(name: str) -> torch.nn.Module:
+    if name == "dice-ce":
+        return DiceCELoss(to_onehot_y=True, softmax=True, include_background=False)
+    if name == "dice-focal":
+        return DiceSoftmaxFocalLoss()
+    raise ValueError(f"Unknown segmentation loss: {name}")
 
 
 def train_epoch(model, loader, optimizer, scaler, loss_function, device, args) -> float:
@@ -606,16 +656,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--train-mode",
-        choices=("decoder", "head"),
-        default="decoder",
+        choices=("decoder", "head", "full"),
         help="Trainable layers: decoder freezes the encoder and trains the decoder plus output head; "
-        "head freezes the pretrained encoder and decoder and trains only the output head (default: %(default)s)",
+        "head freezes the pretrained encoder and decoder and trains only the output head; "
+        "full trains the encoder, decoder, and output head. Default: full without --model, decoder with --model. "
+        "Without --model, only full is supported",
     )
     parser.add_argument(
         "--reuse-decoder",
         action="store_true",
-        help="In decoder mode, initialize the trainable decoder with pretrained weights instead of random weights. "
-        "Head mode always reuses the pretrained decoder (default: disabled)",
+        help="In decoder or full mode, initialize the trainable decoder with pretrained weights instead of random weights. "
+        "Requires --model. Head mode always reuses the pretrained decoder (default: disabled)",
     )
     parser.add_argument(
         "--train-on-train-val",
@@ -625,9 +676,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default=MODEL,
         help="Pretrained MAE Hub model ID or local directory containing config.json and model.safetensors "
-        "(default: %(default)s)",
+        "(default: none; randomly initialize and train the full model from scratch)",
     )
     parser.add_argument(
         "--model-revision",
@@ -799,6 +849,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "(default: %(default)s)",
     )
     parser.add_argument(
+        "--loss",
+        choices=("dice-ce", "dice-focal"),
+        default="dice-ce",
+        help="Foreground soft Dice plus cross-entropy or softmax focal (gamma=2) over all four classes, "
+        "with equal coefficients. Must match when resuming (default: %(default)s)",
+    )
+    parser.add_argument(
         "--lr",
         type=float,
         default=1e-4,
@@ -917,6 +974,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         "OUTPUT/trackio_run.json when the project matches",
     )
     args = parser.parse_args(argv)
+    if args.train_mode is None:
+        args.train_mode = "full" if args.model is None else "decoder"
+    if args.model is None:
+        if args.train_mode != "full":
+            parser.error("--train-mode decoder/head requires --model; scratch training uses --train-mode full")
+        if args.reuse_decoder or args.model_revision is not None:
+            parser.error("--reuse-decoder and --model-revision require --model")
     for name in ("epochs", "batch_size", "accumulation", "download_workers", "val_every", "sw_batch_size"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -983,6 +1047,7 @@ def main(argv=None) -> None:
         "roi": list(args.roi),
         "epochs": args.epochs,
         "batch_size": args.batch_size,
+        "loss": args.loss,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
@@ -996,6 +1061,8 @@ def main(argv=None) -> None:
     }
     if checkpoint is not None:
         previous_signature = dict(checkpoint.get("signature", {}))
+        # Before --loss was introduced, all checkpoints used Dice + CE.
+        previous_signature.setdefault("loss", "dice-ce")
         # Checkpoints predating the split flag always used train -> validation.
         previous_signature.setdefault("split_sources", {"train": ["train"], "validation": ["validation"]})
         if "augmentation" not in previous_signature:
@@ -1069,7 +1136,7 @@ def main(argv=None) -> None:
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "recipe.json", recipe)
     print(f"Mode: {args.train_mode}; trainable: {trainable:,}; frozen: {frozen:,}; device: {device}", flush=True)
-    loss_function = DiceCELoss(to_onehot_y=True, softmax=True, include_background=False)
+    loss_function = build_loss(args.loss).to(device)
     run = start_tracking(args, output, recipe)
     try:
         for epoch in tqdm(
@@ -1095,7 +1162,10 @@ def main(argv=None) -> None:
                 improved = metrics["val/mean_dice"] > best_dice
                 best_dice = max(best_dice, metrics["val/mean_dice"])
             scheduler.step()
-            metrics["val/best_dice"] = best_dice
+            # Keep the pre-validation sentinel in checkpoint state only: emitting
+            # it as a metric makes chart smoothing produce negative Dice scores.
+            if best_dice >= 0:
+                metrics["val/best_dice"] = best_dice
             state = {
                 "format": FORMAT,
                 "model": model.state_dict(),
