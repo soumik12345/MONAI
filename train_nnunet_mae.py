@@ -50,10 +50,12 @@ import math
 import os
 from pathlib import Path
 import random
+from typing import Any, overload
 
 import numpy as np
 import torch
 
+from monai.data import DataLoader
 from monai.engines.mae_trainer import MAETrainerConfig, TrackioConfig, _check_manifest
 from monai.networks.nets import MaskedAutoEncoderDynUnet
 from monai.transforms import Compose, EnsureTyped, MapTransform
@@ -73,7 +75,15 @@ from train_dynmae import (
 FORMAT = "NNUNetMAEPlans-v1"
 
 
-def json_ready(value):
+@overload
+def json_ready(value: dict[str, Any]) -> dict[str, Any]: ...
+
+
+@overload
+def json_ready(value: Any) -> Any: ...
+
+
+def json_ready(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: json_ready(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, np.ndarray)):
@@ -125,7 +135,8 @@ def load_crop(path):
     spacing = np.asarray(nifti.header.get_zooms()[::-1], dtype=float)
     if not np.isfinite(image).all() or not np.isfinite(spacing).all() or np.any(spacing <= 0):
         raise ValueError(f"Nonfinite MRI intensities or invalid spacing: {path}")
-    foreground = binary_fill_holes(image != 0)
+    foreground = np.empty(image.shape, dtype=np.bool_)
+    binary_fill_holes(image != 0, output=foreground)
     locations = np.nonzero(foreground)
     if not locations[0].size:
         raise ValueError(f"Empty foreground: {path}")
@@ -134,7 +145,7 @@ def load_crop(path):
     return image[bbox].copy(), foreground[bbox], spacing, float(relative_size)
 
 
-def fingerprint(rows, limit=0, seed=42, workers=1):
+def fingerprint(rows, limit=0, seed=42, workers=1) -> dict[str, Any]:
     selected = random.Random(seed).sample(rows, limit) if limit and len(rows) > limit else rows
 
     def inspect(row):
@@ -154,7 +165,7 @@ def fingerprint(rows, limit=0, seed=42, workers=1):
     )
 
 
-def topology(spacing, patch, args):
+def topology(spacing, patch, args) -> tuple[tuple[int, ...], dict[str, Any]]:
     from nnunetv2.experiment_planning.experiment_planners.network_topology import get_pool_and_conv_props
 
     _, strides, kernels, roi, _ = get_pool_and_conv_props(spacing, patch, 4, args.max_stages - 1)
@@ -261,7 +272,7 @@ def planning_settings(args):
     return {name: getattr(args, name) for name in names}
 
 
-def create_plan(args, manifest, identity, manifest_base, device):
+def create_plan(args, manifest, identity, manifest_base, device) -> dict[str, Any]:
     # Only the native image-based planning methods are needed. Its normal
     # constructor expects segmentation dataset folders, which MAE does not have.
     from nnunetv2.experiment_planning.experiment_planners.default_experiment_planner import ExperimentPlanner
@@ -277,11 +288,12 @@ def create_plan(args, manifest, identity, manifest_base, device):
             self.suppress_transpose = False
 
     planner = ImageOnlyPlanner()
-    target = planner.determine_fullres_target_spacing()
-    transpose, _ = planner.determine_transpose()
+    target = np.asarray(planner.determine_fullres_target_spacing(), dtype=float)
+    transpose_forward, _ = planner.determine_transpose()
+    transpose = np.asarray(transpose_forward, dtype=np.intp)
     normalization, mask_for_norm = planner.determine_normalization_scheme_and_whether_mask_is_used_for_norm()
     resampled_shapes = np.maximum(1, np.rint(np.asarray(data["shapes_after_crop"]) * data["spacings"] / target))
-    median_shape = np.median(resampled_shapes, axis=0)[transpose]
+    median_shape = np.asarray(np.median(resampled_shapes, axis=0), dtype=float)[transpose]
     spacing = target[transpose]
     aspect = 1 / spacing
     initial = aspect * (256**3 / np.prod(aspect)) ** (1 / 3)
@@ -418,10 +430,29 @@ class PlannedSpatiald(NNSSLSpatiald):
 
 
 class NNUNetMAETrainer(DynMaeTrainer):
-    def make_dataloaders(self, manifest_path, plan, **kwargs):
+    def make_dataloaders(
+        self,
+        manifest_path,
+        roi=(160, 160, 160),
+        workers: int = 0,
+        cache_dir: str | Path | None = None,
+        val_volumes: int = 25,
+        augmentation_backend: str = "monai",
+        transpose_forward=(0, 1, 2),
+        *,
+        plan: dict[str, Any] | None = None,
+    ) -> tuple[DataLoader, DataLoader]:
+        if plan is None:
+            raise ValueError("NNUNetMAETrainer requires an MAE plan in dataloader_config.")
         self.plan = plan
         return super().make_dataloaders(
-            manifest_path, roi=tuple(plan["patch_size"]), transpose_forward=plan["transpose_forward"], **kwargs
+            manifest_path,
+            roi=tuple(plan["patch_size"]),
+            workers=workers,
+            cache_dir=cache_dir,
+            val_volumes=val_volumes,
+            augmentation_backend=augmentation_backend,
+            transpose_forward=tuple(plan["transpose_forward"]),
         )
 
     def make_transforms(self, roi, training, augmentation_backend="monai", transpose_forward=(0, 1, 2)):
