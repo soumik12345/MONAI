@@ -54,6 +54,8 @@ class MAETrainerConfig:
     save_every: int = 100
     val_mask_ratios: tuple[float, ...] = (0.6, 0.75, 0.9)
     ssim_data_range: float = 10.0
+    model_config: dict[str, Any] = field(default_factory=dict)
+    plan_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.mask_ratio is None:
@@ -396,6 +398,9 @@ class MAETrainer(ABC):
         if state["config"].get("epochs") != self.config.epochs:
             raise ValueError("Resume requires the original epoch schedule.")
         config = asdict(self.config)
+        for key, default in (("model_config", {}), ("plan_sha256", None)):
+            if state["config"].get(key, default) != config[key]:
+                raise ValueError(f"Resume requires the original {key} setting.")
         for key in (
             "dataloader_config",
             "seed",

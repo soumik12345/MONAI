@@ -269,7 +269,7 @@ def make_transforms(roi, training, augmentation_backend="monai", transpose_forwa
     return Compose(transforms)
 
 
-def make_batch_augmenter(roi=(160, 160, 160), seed=42):
+def make_batch_augmenter(roi=(160, 160, 160), seed=42, spacing=None):
     """BatchAug adapter; uses CuPy cubic splines instead of grid_sample linear.
 
     Lazy affine fusion is intentionally disabled: native BatchAug materializes
@@ -284,7 +284,12 @@ def make_batch_augmenter(roi=(160, 160, 160), seed=42):
             self.rng = np.random.RandomState(seed)
 
         def sample_params(self, batch_size, shape, device):
-            return {"samples": [sample_spatial_parameters(self.rng) for _ in range(batch_size)]}
+            samples = [sample_spatial_parameters(self.rng) for _ in range(batch_size)]
+            if spacing is not None:
+                scale = np.asarray(spacing, dtype=float)
+                for sample in samples:
+                    sample["matrix"] = sample["matrix"] * scale[None, :] / scale[:, None]
+            return {"samples": samples}
 
         def apply(self, tensor, params):
             images = [apply_spatial(image, tuple(roi), p) for image, p in zip(tensor, params["samples"])]
@@ -337,6 +342,9 @@ class EpochRandomSampler(Sampler[int]):
 
 
 class DynMaeTrainer(MAETrainer):
+    def make_transforms(self, roi, training, augmentation_backend="monai", transpose_forward=(0, 1, 2)):
+        return make_transforms(roi, training, augmentation_backend, transpose_forward)
+
     def make_dataloaders(
         self,
         manifest_path,
@@ -353,7 +361,7 @@ class DynMaeTrainer(MAETrainer):
         self.manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
         partitions = self._check_manifest(manifest)
 
-        transforms = make_transforms(
+        transforms = self.make_transforms(
             roi, training=True, augmentation_backend=augmentation_backend, transpose_forward=transpose_forward
         )
         train_dataset = (
@@ -395,7 +403,7 @@ class DynMaeTrainer(MAETrainer):
             val_rows = random.Random(self.config.seed).sample(val_rows, val_volumes)
 
         self.validation_volume_paths = [row["image"] for row in val_rows]
-        val_transforms = make_transforms(roi, training=False, transpose_forward=transpose_forward)
+        val_transforms = self.make_transforms(roi, training=False, transpose_forward=transpose_forward)
         val_dataset = (
             PersistentDataset(val_rows, val_transforms, cache_dir=cache_dir, hash_transform=pickle_hashing)
             if cache_dir
