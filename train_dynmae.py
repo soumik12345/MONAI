@@ -1,7 +1,12 @@
 """Train MaskedAutoEncoderDynUnet with nnssl-aligned preprocessing/augmentation.
 
     python train_dynmae.py train --manifest yale_mae_restored/manifest.json \
-        --output yale_dynmae --device cuda --batch-size 3 --accumulation 2 --wandb
+        --output yale_dynmae --device cuda --batch-size 3 --accumulation 2 --trackio
+
+Optional experiment logging: uv pip install 'trackio>=0.43.0'
+Add --trackio to log configuration, metrics, and best-checkpoint artifacts.
+Trackio uses local storage by default (configure with TRACKIO_DIR). Pass
+--trackio-space-id username/space to log to a Hugging Face Space instead.
 
 Epochs are complete shuffled passes through the training split, including the
 final partial batch. Updates per epoch are ceil(volumes / (batch * accumulation)).
@@ -30,7 +35,7 @@ from torch.utils.data import RandomSampler, Sampler
 from monai.data import DataLoader, Dataset, MetaTensor, PersistentDataset
 from monai.networks.nets import MaskedAutoEncoderDynUnet
 from monai.data.utils import pickle_hashing
-from monai.engines.mae_trainer import MAETrainer, MAETrainerConfig, WandbConfig
+from monai.engines.mae_trainer import MAETrainer, MAETrainerConfig, TrackioConfig
 from monai.utils import set_determinism
 from monai.transforms import Compose, EnsureTyped, MapTransform, RandomizableTransform, Resample
 
@@ -443,11 +448,27 @@ def parse_args(argv=None):
     parser.add_argument("--ssim-data-range", type=float, default=10.0)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--log-every", type=int, default=1)
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", default="yale-mae")
-    parser.add_argument("--wandb-entity", default=None)
-    parser.add_argument("--wandb-name", default=None)
-    parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
+    parser.add_argument(
+        "--trackio",
+        action="store_true",
+        help="Log configuration, metrics, and best-checkpoint artifacts with Trackio. Uses local storage "
+        "by default; TRACKIO_DIR configures its location (default: disabled)",
+    )
+    parser.add_argument(
+        "--trackio-project",
+        default="yale-mae",
+        help="Trackio project used when --trackio is enabled (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--trackio-space-id",
+        help="Optional Hugging Face Space, such as username/space, for Trackio logging; created if missing. "
+        "If omitted, uses Trackio's environment settings or local storage",
+    )
+    parser.add_argument(
+        "--trackio-name",
+        help="Trackio run name; generated if omitted on a new run. With --resume, reuses the name saved in "
+        "OUTPUT/trackio_run.json when the project matches",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -496,11 +517,11 @@ def main(argv=None):
             "augmentation_backend": args.augmentation_backend,
             "transpose_forward": transpose_forward,
         },
-        wandb_config=WandbConfig(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            run_name=args.wandb_name,
-            mode=args.wandb_mode if args.wandb else "disabled",
+        trackio_config=TrackioConfig(
+            project=args.trackio_project,
+            run_name=args.trackio_name,
+            space_id=args.trackio_space_id,
+            enabled=args.trackio,
         ),
         seed=args.seed,
         device=device,
@@ -547,20 +568,15 @@ def main(argv=None):
         "updates_per_epoch": trainer.updates_per_epoch if args.epochs is not None else None,
         "validation_volume_paths": trainer.validation_volume_paths,
     }
-    try:
-        (output / "recipe.json").write_text(json.dumps(recipe, indent=2))
-        trainer.run.config.update({key: value for key, value in recipe.items() if key != "config"})
-        print(
-            f"Device {device}; effective batch {trainer.effective_batch_size}; "
-            f"optimizer updates {args.steps}; "
-            + (f"epochs {args.epochs} ({trainer.updates_per_epoch} updates each); " if args.epochs is not None else "")
-            + f"manifest {manifest_path}",
-            flush=True,
-        )
-    except BaseException:
-        trainer.run.finish(exit_code=1)
-        raise
-    trainer.train(batch_augmenter=batch_augmenter)
+    (output / "recipe.json").write_text(json.dumps(recipe, indent=2))
+    print(
+        f"Device {device}; effective batch {trainer.effective_batch_size}; "
+        f"optimizer updates {args.steps}; "
+        + (f"epochs {args.epochs} ({trainer.updates_per_epoch} updates each); " if args.epochs is not None else "")
+        + f"manifest {manifest_path}",
+        flush=True,
+    )
+    trainer.train(batch_augmenter=batch_augmenter, tracking_config=recipe)
 
 
 if __name__ == "__main__":

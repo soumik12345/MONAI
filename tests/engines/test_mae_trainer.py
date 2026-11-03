@@ -1,5 +1,6 @@
 """CPU integration checks for MAE training orchestration."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,7 @@ from unittest.mock import Mock, patch
 import torch
 from torch.utils.data import DataLoader
 
-from monai.engines.mae_trainer import MAETrainer, MAETrainerConfig, WandbConfig
+from monai.engines.mae_trainer import MAETrainer, MAETrainerConfig, TrackioConfig
 
 
 class TinyMAE(torch.nn.Module):
@@ -35,15 +36,24 @@ class TestMAETrainer(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.wandb = patch("monai.engines.mae_trainer.wandb.init", side_effect=lambda **kwargs: Mock())
-        self.wandb.start()
-        self.addCleanup(self.wandb.stop)
+        self.trackio = Mock()
+        self.trackio.init.side_effect = self.new_run
+        self.optional_import = patch("monai.engines.mae_trainer.optional_import", return_value=(self.trackio, True))
+        self.import_tracking = self.optional_import.start()
+        self.addCleanup(self.optional_import.stop)
+
+    @staticmethod
+    def new_run(**kwargs):
+        run = Mock(spec=["name", "id", "log", "log_artifact", "finish"])
+        run.name = kwargs["name"] or "generated-run"
+        run.id = "test-run-id"
+        return run
 
     def trainer(self, **kwargs):
         options = dict(
             output_dir=self.directory.name,
             dataloader_config={},
-            wandb_config=WandbConfig(project="test"),
+            trackio_config=TrackioConfig(project="test", enabled=True),
             device="cpu",
             local_batch_size=1,
             gradient_accumualtion_steps=2,
@@ -67,7 +77,17 @@ class TestMAETrainer(unittest.TestCase):
         logs = [call.args[0] for call in trainer.run.log.call_args_list]
         self.assertEqual([log["optimizer_step"] for log in logs if "train/lr" in log], [2, 3])
         self.assertAlmostEqual(logs[0]["train/lr"], 0.001 * (1 - 1 / 3) ** 0.9)
-        trainer.run.finish.assert_called_once_with(exit_code=0)
+        self.assertEqual([call.kwargs["step"] for call in trainer.run.log.call_args_list], [2, 2, 3, 3])
+        for call in trainer.run.log_artifact.call_args_list:
+            self.assertEqual(call.args, (Path(self.directory.name) / "best.pt",))
+            self.assertEqual(call.kwargs, {"name": "run-test-run-id-best", "type": "model", "aliases": ["best"]})
+        self.assertTrue(trainer.run.log_artifact.called)
+        trainer.run.finish.assert_called_once_with()
+        # Pre-migration checkpoints have a wandb config; tracking settings must
+        # not prevent resuming their model, optimizer, and RNG state.
+        del state["config"]["trackio_config"]
+        state["config"]["wandb_config"] = {"project": "test", "mode": "disabled"}
+        torch.save(state, Path(self.directory.name) / "last.pt")
         resumed = self.trainer(resume=True)
         with patch.object(resumed, "train_step") as step:
             resumed.train()
@@ -90,7 +110,7 @@ class TestMAETrainer(unittest.TestCase):
         with patch.object(trainer, "train_step", side_effect=interrupted):
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
                 trainer.train()
-        trainer.run.finish.assert_called_once_with(exit_code=1)
+        trainer.run.finish.assert_called_once_with()
         resumed = self.trainer(steps=4, resume=True)
         with patch.object(resumed, "train_step", wraps=resumed.train_step) as step:
             resumed.train()
@@ -133,7 +153,7 @@ class TestMAETrainer(unittest.TestCase):
         trainer = self.trainer(steps=1)
         with self.assertRaises(FileExistsError):
             trainer.train()
-        trainer.run.finish.assert_called_once_with(exit_code=1)
+        trainer.run.finish.assert_called_once_with()
         resumed = self.trainer(steps=1, resume=True, mask_ratio=0.6)
         with self.assertRaisesRegex(ValueError, "mask_ratio"):
             resumed.train()
@@ -144,6 +164,64 @@ class TestMAETrainer(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonempty"):
             trainer.validate()
         self.assertTrue(trainer.model.training)
+
+    def test_tracking_disabled_does_not_import_trackio(self):
+        trainer = self.trainer(steps=1, trackio_config=TrackioConfig())
+        trainer.train()
+        self.import_tracking.assert_not_called()
+        self.assertIsNone(trainer.run)
+        self.assertTrue((Path(self.directory.name) / "last.pt").exists())
+        self.assertFalse((Path(self.directory.name) / "trackio_run.json").exists())
+
+    def test_tracking_missing_dependency(self):
+        self.import_tracking.return_value = (None, False)
+        trainer = self.trainer(steps=1)
+        with self.assertRaisesRegex(ImportError, "trackio>=0.43.0"):
+            trainer.train()
+        self.trackio.init.assert_not_called()
+
+    def test_tracking_recipe_and_resume_identity(self):
+        tracking = TrackioConfig(project="test", run_name="original", space_id="user/space", enabled=True)
+        trainer = self.trainer(steps=1, trackio_config=tracking)
+        recipe = {"config": {"steps": 1}, "manifest_sha256": "example"}
+        trainer.train(tracking_config=recipe)
+        self.import_tracking.assert_called_once_with("trackio", version="0.43.0")
+        self.trackio.init.assert_called_once_with(
+            project="test", name="original", space_id="user/space", config=recipe, resume="never", embed=False
+        )
+        metadata_path = Path(self.directory.name) / "trackio_run.json"
+        metadata = json.loads(metadata_path.read_text())
+        self.assertEqual(
+            metadata, {"project": "test", "name": "original", "id": "test-run-id", "space_id": "user/space"}
+        )
+        resumed = self.trainer(steps=1, resume=True)
+        resumed.train()
+        options = self.trackio.init.call_args.kwargs
+        self.assertEqual(options["name"], "original")
+        self.assertEqual(options["space_id"], "user/space")
+        self.assertEqual(options["resume"], "allow")
+
+    def test_tracking_resume_different_project_does_not_reuse_identity(self):
+        metadata_path = Path(self.directory.name) / "trackio_run.json"
+        metadata_path.write_text(json.dumps({"project": "other", "name": "previous", "space_id": "user/previous"}))
+        trainer = self.trainer(steps=1, resume=True)
+        with self.assertRaises(FileNotFoundError):
+            trainer.train()
+        options = self.trackio.init.call_args.kwargs
+        self.assertIsNone(options["name"])
+        self.assertIsNone(options["space_id"])
+        trainer.run.finish.assert_called_once_with()
+
+    def test_tracking_resume_explicit_identity_overrides_saved_values(self):
+        metadata_path = Path(self.directory.name) / "trackio_run.json"
+        metadata_path.write_text(json.dumps({"project": "test", "name": "previous", "space_id": "user/previous"}))
+        tracking = TrackioConfig(project="test", run_name="replacement", space_id="user/new", enabled=True)
+        trainer = self.trainer(steps=1, resume=True, trackio_config=tracking)
+        with self.assertRaises(FileNotFoundError):
+            trainer.train()
+        options = self.trackio.init.call_args.kwargs
+        self.assertEqual(options["name"], "replacement")
+        self.assertEqual(options["space_id"], "user/new")
 
 
 if __name__ == "__main__":

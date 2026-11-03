@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from tqdm.auto import tqdm
 from abc import ABC, abstractmethod
@@ -7,10 +8,10 @@ from dataclasses import dataclass, asdict, field
 from typing import TYPE_CHECKING, Any
 from pathlib import Path
 import torch
-import wandb
 import torch.nn.functional as F
 
 from monai.bundle import ConfigComponent
+from monai.utils import optional_import
 
 if TYPE_CHECKING:
     from monai.networks.nets import MaskedAutoEncoderDynUnet
@@ -18,18 +19,18 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class WandbConfig:
-    project: str
-    entity: str | None = None
+class TrackioConfig:
+    project: str = "yale-mae"
     run_name: str | None = None
-    mode: str = "online"
+    space_id: str | None = None
+    enabled: bool = False
 
 
 @dataclass
 class MAETrainerConfig:
     output_dir: str
     dataloader_config: dict[str, Any]
-    wandb_config: WandbConfig
+    trackio_config: TrackioConfig = field(default_factory=TrackioConfig)
     seed: int = 42
     device: str = "auto"
     resume: bool = False
@@ -171,18 +172,37 @@ class MAETrainer(ABC):
 
         self.dataloader, self.val_dataloader = self.make_dataloaders(**self.config.dataloader_config)
 
-        self.run = wandb.init(
-            project=self.config.wandb_config.project,
-            entity=self.config.wandb_config.entity,
-            name=self.config.wandb_config.run_name,
-            mode=self.config.wandb_config.mode,
-            dir=str(self.output_dir.resolve()),
-            save_code=True,
-            config=asdict(self.config),
+        self.run = None
+
+    def _start_tracking(self, config: dict[str, Any]) -> None:
+        """Initialize optional Trackio logging and retain the run identity for resume."""
+        tracking = self.config.trackio_config
+        if not tracking.enabled:
+            return
+        trackio, available = optional_import("trackio", version="0.43.0")
+        if not available:
+            raise ImportError("Trackio logging requires `uv pip install 'trackio>=0.43.0'`.")
+        metadata_path = self.output_dir / "trackio_run.json"
+        previous = json.loads(metadata_path.read_text()) if self.config.resume and metadata_path.exists() else {}
+        same_project = previous.get("project") == tracking.project
+        name = tracking.run_name or (previous.get("name") if same_project else None)
+        space_id = tracking.space_id or (previous.get("space_id") if same_project else None)
+        self.run = trackio.init(
+            project=tracking.project,
+            name=name,
+            space_id=space_id,
+            config=config,
+            resume="allow" if self.config.resume else "never",
+            embed=False,
         )
-        self.run.define_metric("optimizer_step")
-        self.run.define_metric("train/*", step_metric="optimizer_step")
-        self.run.define_metric("val/*", step_metric="optimizer_step")
+        metadata_path.write_text(
+            json.dumps(
+                {"project": tracking.project, "name": self.run.name, "id": self.run.id, "space_id": space_id},
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        )
 
     def _check_manifest(self, manifest):
         partitions = manifest["partitions"]
@@ -363,8 +383,8 @@ class MAETrainer(ABC):
         temporary = path.with_suffix(path.suffix + ".tmp")
         torch.save(state, temporary)
         temporary.replace(path)
-        if self.run is not None:
-            self.run.log_model(path=str(path))
+        if self.run is not None and path.name == "best.pt":
+            self.run.log_artifact(path, name=f"run-{self.run.id}-best", type="model", aliases=["best"])
 
     def load_checkpoint(self, path: Path) -> tuple[int, float, float | None]:
         """Restore a trainer checkpoint after checking the training recipe."""
@@ -400,16 +420,13 @@ class MAETrainer(ABC):
         self._pending_epoch_batches = None
         return state["step"], state["best_val_loss"], state["val_loss"]
 
-    def train(self, *, batch_augmenter: Any = None) -> None:
-        exit_code = 0
+    def train(self, *, batch_augmenter: Any = None, tracking_config: dict[str, Any] | None = None) -> None:
         try:
+            self._start_tracking(asdict(self.config) if tracking_config is None else tracking_config)
             self._train(batch_augmenter=batch_augmenter)
-        except BaseException:
-            exit_code = 1
-            raise
         finally:
             if self.run is not None:
-                self.run.finish(exit_code=exit_code)
+                self.run.finish()
 
     def _train(self, *, batch_augmenter: Any = None) -> None:
         total_steps = self.config.steps
@@ -457,7 +474,8 @@ class MAETrainer(ABC):
                                 "train/masked_mae": total_mae / logged_steps,
                                 "train/lr": lr,
                                 "train/mask_ratio": metrics["train/mask_ratio"],
-                            }
+                            },
+                            step=steps_completed,
                         )
                     total_mse, total_mae, logged_steps = 0.0, 0.0, 0
                 if steps_completed % self.config.validate_every == 0 or final_step:
@@ -473,7 +491,8 @@ class MAETrainer(ABC):
                                 "optimizer_step": steps_completed,
                                 **val_metrics,
                                 "val/best_masked_mse": best_validation_loss,
-                            }
+                            },
+                            step=steps_completed,
                         )
                     if improved:
                         self.save_checkpoint(
